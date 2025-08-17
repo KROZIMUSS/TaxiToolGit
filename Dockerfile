@@ -1,24 +1,22 @@
-# syntax=docker/dockerfile:1
+# Dockerfile
 FROM python:3.11-slim
 
-# Keep Python clean & chatty for logs
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+# System deps (geopy/nominatim may need these)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# (Optional) system tools if wheels need building
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-  && rm -rf /var/lib/apt/lists/*
-
-# Install deps first for better cache
+# Install Python deps first (better layer cache)
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Add your code
+# Add app code
 COPY . .
 
-# Start your bot
+# Cloud Run listens on $PORT (we'll set 8080)
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8080
 CMD ["python", "-u", "TaxiToolBOT.py"]

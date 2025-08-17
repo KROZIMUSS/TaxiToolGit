@@ -1,0 +1,9 @@
+.venv
+.env
+*.txt
+.gcloudignore
+.git
+.gitignore
+.idea
+__pycache__/
+!requirements.txt

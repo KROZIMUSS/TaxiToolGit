@@ -1,6 +1,6 @@
 import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 from supabase import create_client, Client
 from datetime import datetime, timedelta, date
 from openai import OpenAI
@@ -14,15 +14,29 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # === Configuration ===
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")  # used locally; Cloud Run ignores .env
 
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")  # safer than os.environ["..."]
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN. Create .env or set env var.")
-BOT_TOKEN = os.environ["TELEGRAM_TOKEN"]
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-client = OpenAI(api_key= os.environ["OPENAI_KEY"])
+def require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v or not v.strip():
+        raise RuntimeError(f"[startup] Missing required env var: {name}")
+    return v.strip()  # trim newlines/spaces that Secret Manager values sometimes carry
+
+TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_TOKEN")
+SUPABASE_URL       = require_env("SUPABASE_URL")
+SUPABASE_KEY       = require_env("SUPABASE_KEY")
+OPENAI_KEY         = require_env("OPENAI_KEY")
+
+# === Initialize clients (with clear error logging) ===
+try:
+    client = OpenAI(api_key=OPENAI_KEY)
+except Exception as e:
+    raise RuntimeError(f"[startup] OpenAI client init failed: {e}")
+
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    raise RuntimeError(f"[startup] Supabase client init failed: {e}")
 
 # === Initialize Supabase ===
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -1504,80 +1518,25 @@ async def rent_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Main Setup ===
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # --- runtime config for Cloud Run / local ---
+    MODE = os.getenv("MODE", "polling")             # 'webhook' on Cloud Run
+    PORT = int(os.getenv("PORT", "8080"))           # Cloud Run provides this
+    HOST = "0.0.0.0"
+    WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+    WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "set-a-secret")
+
+    # Build app ONCE with your real bot token
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("Unhandled exception", exc_info=context.error)
-
     app.add_error_handler(on_error)
 
-    app.add_handler(MessageHandler(filters.Regex("^(Yes|No)$"), handle_insurance_feedback))
-    browse_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Browse$"), handle_browse)],
-        states={
-            AWAIT_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_search)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)],
-    )
-
-    edit_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_editing_listing, pattern=r"^edit_[0-9a-fA-F-]{36}$")],
-        states={
-            EDIT_CHOICE: [
-                CallbackQueryHandler(handle_edit_field_choice, pattern="^edit_field_"),
-                CallbackQueryHandler(cancel_editing, pattern="^cancel_edit$")
-            ],
-            AWAIT_NEW_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_category)],
-            AWAIT_NEW_ITEM_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_item_title)],
-            AWAIT_NEW_BRAND_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_brand_model)],
-            AWAIT_NEW_SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_specs)],
-            AWAIT_NEW_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_tags)],
-            AWAIT_NEW_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_description)],
-            AWAIT_NEW_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_condition)],
-            AWAIT_NEW_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_price)],
-            AWAIT_NEW_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_location)],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_editing, pattern="^cancel_edit$")],
-        per_chat=True,
-    )
-
-    listing_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Create a Listing$"), start_listing)],
-        states={
-            GET_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_category)],
-            GET_ITEM_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_title)],
-            GET_BRAND_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_brand_model)],
-            GET_SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_specs)],
-            GET_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tags)],
-            GET_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_description)],
-            GET_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_condition)],
-            GET_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_price)],
-            GET_PHOTOS: [
-                MessageHandler(filters.PHOTO, get_photos),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_photos)
-            ],
-            GET_LOCATION: [MessageHandler(filters.LOCATION | filters.TEXT & ~filters.COMMAND, get_location)],
-            GET_AVAILABILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_availability)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)]
-    )
-
-    settings_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Settings$"), handle_settings)],
-        states={
-            SETTINGS_MENU: [
-                MessageHandler(filters.Regex("^Change Location$"), prompt_location_choice)
-            ],
-            AWAIT_LOCATION_CHOICE: [
-                MessageHandler(filters.LOCATION, save_location_from_gps),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_location_from_text)
-            ],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)]
-    )
-
+    # === register ALL handlers here (your existing ones) ===
     app.add_handler(CommandHandler("start", start))
+
+    # Conversations/handlers you already set up:
     app.add_handler(listing_conv)
-    app.add_handler(MessageHandler(filters.Regex("^(Yes|No)$"), handle_insurance_feedback))
     app.add_handler(MessageHandler(filters.Regex("^Back$"), go_back))
     app.add_handler(MessageHandler(filters.Regex("^My Listings$"), view_my_listings))
     app.add_handler(edit_conv)
@@ -1589,28 +1548,31 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(browse_next_match, pattern="^browse_next$"))
     app.add_handler(CallbackQueryHandler(browse_prev_match, pattern="^browse_prev$"))
 
-    # Rental flow handlers
+    # Rental flow
     app.add_handler(CallbackQueryHandler(rent_choose_year,   pattern=r"^rent_year_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_choose_month,  pattern=r"^rent_month_[0-9a-fA-F-]{36}_(2025|2026)$"))
     app.add_handler(CallbackQueryHandler(rent_choose_range,  pattern=r"^rent_range_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
     app.add_handler(CallbackQueryHandler(rent_show_days,     pattern=r"^rent_day_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])_([0-2]?[0-9]|3[01])_([0-2]?[0-9]|3[01])$"))
     app.add_handler(CallbackQueryHandler(rent_pick_day,      pattern=r"^rent_pick_[0-9a-fA-F-]{36}_.+$"))
-
-    # Back / misc
     app.add_handler(CallbackQueryHandler(rent_back_to_listing, pattern=r"^rent_back_to_listing$"))
     app.add_handler(CallbackQueryHandler(rent_year_back,       pattern=r"^rent_year_back$"))
     app.add_handler(CallbackQueryHandler(rent_month_back,      pattern=r"^rent_month_back_[0-9a-fA-F-]{36}_(2025|2026)$"))
     app.add_handler(CallbackQueryHandler(rent_range_back,      pattern=r"^rent_range_back_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
     app.add_handler(CallbackQueryHandler(noop,                 pattern=r"^noop$"))
+    app.add_handler(CallbackQueryHandler(rent_finish_prompt,   pattern=r"^rent_finish_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(rent_confirm_yes,     pattern=r"^rent_confirm_yes_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(rent_confirm_no,      pattern=r"^rent_confirm_no_[0-9a-fA-F-]{36}$"))
 
-    # Multi-select flow
-    app.add_handler(CallbackQueryHandler(rent_finish_prompt, pattern=r"^rent_finish_[0-9a-fA-F-]{36}$"))
-    app.add_handler(CallbackQueryHandler(rent_confirm_yes,   pattern=r"^rent_confirm_yes_[0-9a-fA-F-]{36}$"))
-    app.add_handler(CallbackQueryHandler(rent_confirm_no,    pattern=r"^rent_confirm_no_[0-9a-fA-F-]{36}$"))
+    # Insurance feedback (add once)
+    app.add_handler(MessageHandler(filters.Regex("^(Yes|No)$"), handle_insurance_feedback))
 
-    # Cancel (global for rent flow)
-    app.add_handler(CallbackQueryHandler(rent_cancel,        pattern=r"^rent_cancel$"))
+    # Settings conv
+    app.add_handler(settings_conv)
 
-
-    print("Bot started...")
-    app.run_polling()
+    # === run ===
+    if MODE == "webhook":
+        # We'll set the Telegram webhook URL after deploy via curl using SERVICE_URL + WEBHOOK_PATH
+        app.run_webhook(listen=HOST, port=PORT, url_path=WEBHOOK_PATH, secret_token=WEBHOOK_SECRET)
+    else:
+        print("Bot started (polling)...")
+        app.run_polling()
