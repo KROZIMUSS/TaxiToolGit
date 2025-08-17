@@ -1516,6 +1516,64 @@ async def rent_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
                               ))
 
+# === Conversation Handlers ===
+listing_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex("^Create a Listing$"), start_listing)],
+    states={
+        GET_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_category)],
+        GET_ITEM_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_title)],
+        GET_BRAND_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_brand_model)],
+        GET_SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_specs)],
+        GET_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tags)],
+        GET_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_description)],
+        GET_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_condition)],
+        GET_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_price)],
+        GET_PHOTOS: [MessageHandler(filters.PHOTO | filters.TEXT, get_photos)],
+        GET_LOCATION: [MessageHandler(filters.LOCATION | filters.TEXT, get_location)],
+        GET_AVAILABILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_availability)]
+    },
+    fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)]
+)
+
+edit_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(start_editing_listing, pattern=r"^edit_[0-9a-fA-F-]{36}$")],
+    states={
+        EDIT_CHOICE: [CallbackQueryHandler(handle_edit_field_choice)],
+        AWAIT_NEW_DESCRIPTION: [MessageHandler(filters.TEXT, receive_new_description)],
+        AWAIT_NEW_PRICE: [MessageHandler(filters.TEXT, receive_new_price)],
+        AWAIT_NEW_LOCATION: [MessageHandler(filters.TEXT, receive_new_location)],
+        AWAIT_NEW_CATEGORY: [MessageHandler(filters.TEXT, receive_new_category)],
+        AWAIT_NEW_CONDITION: [MessageHandler(filters.TEXT, receive_new_condition)],
+        AWAIT_NEW_ITEM_TITLE: [MessageHandler(filters.TEXT, receive_new_item_title)],
+        AWAIT_NEW_BRAND_MODEL: [MessageHandler(filters.TEXT, receive_new_brand_model)],
+        AWAIT_NEW_SPECS: [MessageHandler(filters.TEXT, receive_new_specs)],
+        AWAIT_NEW_TAGS: [MessageHandler(filters.TEXT, receive_new_tags)],
+        CONFIRM_DELETE: [CallbackQueryHandler(handle_delete_confirmation)]
+    },
+    fallbacks=[CallbackQueryHandler(cancel_editing, pattern="^cancel_edit$")]
+)
+
+browse_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex("^Browse$"), handle_browse)],
+    states={
+        AWAIT_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_search)]
+    },
+    fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)]
+)
+
+settings_conv = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex("^Settings$"), handle_settings)],
+    states={
+        SETTINGS_MENU: [MessageHandler(filters.Regex("^Change Location$"), prompt_location_choice)],
+        AWAIT_LOCATION_CHOICE: [
+            MessageHandler(filters.LOCATION, save_location_from_gps),
+            MessageHandler(filters.Regex("^Type in Location Manually$"), lambda u, c: AWAIT_LOCATION_CHOICE),
+            MessageHandler(filters.TEXT, save_location_from_text)
+        ]
+    },
+    fallbacks=[MessageHandler(filters.Regex("^Back$"), go_back)]
+)
+
 # === Main Setup ===
 if __name__ == '__main__':
     # --- runtime config for Cloud Run / local ---
@@ -1574,5 +1632,33 @@ if __name__ == '__main__':
         # We'll set the Telegram webhook URL after deploy via curl using SERVICE_URL + WEBHOOK_PATH
         app.run_webhook(listen=HOST, port=PORT, url_path=WEBHOOK_PATH, secret_token=WEBHOOK_SECRET)
     else:
+        # For Cloud Run, we need to run an HTTP server even in polling mode
+        import asyncio
+        from threading import Thread
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path in ['/health', '/']:
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/plain')
+                    self.end_headers()
+                    self.wfile.write(b'OK')
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self, format, *args):
+                pass  # Suppress HTTP server logs
+        
+        def run_health_server():
+            server = HTTPServer((HOST, PORT), HealthHandler)
+            server.serve_forever()
+        
+        # Start health server in background thread
+        health_thread = Thread(target=run_health_server, daemon=True)
+        health_thread.start()
+        print(f"Health server started on {HOST}:{PORT}")
+        
         print("Bot started (polling)...")
         app.run_polling()
