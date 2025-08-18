@@ -40,7 +40,9 @@ jobs:
           docker push $IMAGE_NAME:$GITHUB_SHA
           docker push $IMAGE_NAME:latest
 
-      - name: Deploy to Cloud Run
+      # Deploy WITHOUT touching your existing secret-type env vars.
+      # Only set MODE and WEBHOOK_PATH as plain envs (safe).
+      - name: Deploy to Cloud Run (webhook mode)
         run: |
           gcloud run deploy $SERVICE_NAME \
             --image $IMAGE_NAME:$GITHUB_SHA \
@@ -52,7 +54,7 @@ jobs:
             --min-instances 0 \
             --max-instances 10 \
             --port 8080 \
-            --set-env-vars MODE=polling \
+            --set-env-vars MODE=webhook,WEBHOOK_PATH=/webhook \
             --quiet
 
       - name: Get service URL
@@ -61,8 +63,15 @@ jobs:
           echo "Service deployed to: $SERVICE_URL"
           echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
 
-      - name: Verify deployment
+      # Register Telegram webhook — must use the SAME secret value as Cloud Run's WEBHOOK_SECRET.
+      - name: Set Telegram webhook
         run: |
-          sleep 30
-          curl -f $SERVICE_URL/health || exit 1
-          echo "✅ Deployment verified successfully"
+          curl -sS "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook" \
+            -d "url=${{ env.SERVICE_URL }}/webhook" \
+            -d "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
+            -d "drop_pending_updates=true" \
+            -d 'allowed_updates=["message","callback_query"]'
+
+      - name: Verify webhook status
+        run: |
+          curl -sS "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/getWebhookInfo"
