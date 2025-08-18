@@ -16,25 +16,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      # Auth to GCP using your existing JSON key (keeps your current approach)
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          project_id: ${{ env.PROJECT_ID }}
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          export_default_credentials: true
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Configure Docker auth for GCR
-        run: gcloud auth configure-docker --quiet
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Build image
-        run: docker build -t $IMAGE_NAME:$GITHUB_SHA .
+      - name: Configure Docker to use gcloud as a credential helper
+        run: gcloud auth configure-docker
 
-      - name: Push image
-        run: docker push $IMAGE_NAME:$GITHUB_SHA
+      - name: Build Docker image
+        run: |
+          docker build -t $IMAGE_NAME:$GITHUB_SHA .
+          docker tag $IMAGE_NAME:$GITHUB_SHA $IMAGE_NAME:latest
+
+      - name: Push Docker image to GCR
+        run: |
+          docker push $IMAGE_NAME:$GITHUB_SHA
+          docker push $IMAGE_NAME:latest
 
       # ── DEPLOY: Webhook mode ────────────────────────────────────────────────
       # Keep other deploy features; we just set MODE=webhook + needed secrets
