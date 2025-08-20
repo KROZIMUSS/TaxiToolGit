@@ -1651,40 +1651,47 @@ if __name__ == '__main__':
         server.serve_forever()
     
     if MODE == "webhook":
-        from flask import Flask, request, Response
-        import requests
+        import asyncio
+        from aiohttp import web
+        from aiohttp.web import Request, Response
         from telegram import Update
-        
-        flask_app = Flask(__name__)
-        
-        @flask_app.route('/health')
-        @flask_app.route('/')
-        def health():
-            return 'OK', 200
-        
-        @flask_app.route(WEBHOOK_PATH, methods=['POST'])
-        def webhook():
-            try:
-                # Verify secret token
-                if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
-                    return 'Unauthorized', 401
-                
-                # Process update
-                json_data = request.get_json()
-                if json_data:
-                    update = Update.de_json(json_data, app.bot)
-                    asyncio.run(app.process_update(update))
-                
-                return 'OK', 200
-            except Exception as e:
-                print(f"Webhook error: {e}")
-                return 'Error', 500
+        import json as json_lib
         
         print(f"Starting webhook mode on {HOST}:{PORT}")
         print(f"Webhook endpoint: {WEBHOOK_PATH}")
         print(f"Health endpoint: /health")
         
-        flask_app.run(host=HOST, port=PORT, debug=False)
+        # Initialize the application
+        asyncio.run(app.initialize())
+        
+        async def health_handler(request):
+            return Response(text='OK', status=200)
+        
+        async def webhook_handler(request):
+            try:
+                # Verify secret token
+                if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+                    return Response(text='Unauthorized', status=401)
+                
+                # Process update
+                json_data = await request.json()
+                if json_data:
+                    update = Update.de_json(json_data, app.bot)
+                    await app.process_update(update)
+                
+                return Response(text='OK', status=200)
+            except Exception as e:
+                print(f"Webhook error: {e}")
+                return Response(text='Error', status=500)
+        
+        # Create aiohttp app
+        aiohttp_app = web.Application()
+        aiohttp_app.router.add_get('/health', health_handler)
+        aiohttp_app.router.add_get('/', health_handler)
+        aiohttp_app.router.add_post(WEBHOOK_PATH, webhook_handler)
+        
+        # Run the server
+        web.run_app(aiohttp_app, host=HOST, port=PORT)
     else:
         # Start health server in background thread
         health_thread = Thread(target=run_health_server, daemon=True)
