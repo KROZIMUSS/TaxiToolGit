@@ -1628,33 +1628,64 @@ if __name__ == '__main__':
     app.add_handler(settings_conv)
 
     # === run ===
+    import asyncio
+    from threading import Thread
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ['/health', '/']:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'OK')
+            else:
+                self.send_response(404)
+                self.end_headers()
+        
+        def log_message(self, format, *args):
+            pass  # Suppress HTTP server logs
+    
+    def run_health_server():
+        server = HTTPServer((HOST, PORT), HealthHandler)
+        server.serve_forever()
+    
     if MODE == "webhook":
-        # We'll set the Telegram webhook URL after deploy via curl using SERVICE_URL + WEBHOOK_PATH
-        app.run_webhook(listen=HOST, port=PORT, url_path=WEBHOOK_PATH, secret_token=WEBHOOK_SECRET)
+        from flask import Flask, request, Response
+        import requests
+        from telegram import Update
+        
+        flask_app = Flask(__name__)
+        
+        @flask_app.route('/health')
+        @flask_app.route('/')
+        def health():
+            return 'OK', 200
+        
+        @flask_app.route(WEBHOOK_PATH, methods=['POST'])
+        def webhook():
+            try:
+                # Verify secret token
+                if request.headers.get('X-Telegram-Bot-Api-Secret-Token') != WEBHOOK_SECRET:
+                    return 'Unauthorized', 401
+                
+                # Process update
+                json_data = request.get_json()
+                if json_data:
+                    update = Update.de_json(json_data, app.bot)
+                    asyncio.run(app.process_update(update))
+                
+                return 'OK', 200
+            except Exception as e:
+                print(f"Webhook error: {e}")
+                return 'Error', 500
+        
+        print(f"Starting webhook mode on {HOST}:{PORT}")
+        print(f"Webhook endpoint: {WEBHOOK_PATH}")
+        print(f"Health endpoint: /health")
+        
+        flask_app.run(host=HOST, port=PORT, debug=False)
     else:
-        # For Cloud Run, we need to run an HTTP server even in polling mode
-        import asyncio
-        from threading import Thread
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        
-        class HealthHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path in ['/health', '/']:
-                    self.send_response(200)
-                    self.send_header('Content-type', 'text/plain')
-                    self.end_headers()
-                    self.wfile.write(b'OK')
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-            
-            def log_message(self, format, *args):
-                pass  # Suppress HTTP server logs
-        
-        def run_health_server():
-            server = HTTPServer((HOST, PORT), HealthHandler)
-            server.serve_forever()
-        
         # Start health server in background thread
         health_thread = Thread(target=run_health_server, daemon=True)
         health_thread.start()

@@ -62,6 +62,19 @@ jobs:
           echo "Service deployed to: $SERVICE_URL"
           echo "SERVICE_URL=$SERVICE_URL" >> $GITHUB_ENV
 
+      - name: Wait for service to be ready
+        run: |
+          echo "Waiting for service to be ready..."
+          for i in {1..30}; do
+            if curl -f -s ${{ env.SERVICE_URL }}/health > /dev/null; then
+              echo "✅ Service is ready!"
+              break
+            else
+              echo "Waiting for service... ($i/30)"
+              sleep 10
+            fi
+          done
+
       # Register Telegram webhook — assumes your Cloud Run Secret WEBHOOK_PATH is "/webhook".
       - name: Set Telegram webhook
         run: |
