@@ -141,7 +141,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
     await update.message.reply_text(
-        "Hi! I'm TaxiTool — your tool-sharing assistant. You can rent tools from others or list your own.",
+        "Hi! I'm RentoTo — your tool-sharing assistant. You can rent tools from others or list your own.",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
