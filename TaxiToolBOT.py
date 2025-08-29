@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import re
+import base64
 
 # === Configuration ===
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")  # used locally; Cloud Run ignores .env
@@ -45,9 +47,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 logging.basicConfig(level=logging.INFO)
 
 # === States ===
-GET_CATEGORY, GET_ITEM_TITLE, GET_BRAND_MODEL, GET_SPECS, GET_TAGS, GET_DESCRIPTION, GET_CONDITION, GET_PRICE, GET_PHOTOS, GET_LOCATION, GET_AVAILABILITY, BROWSE_SEARCH = range(12)
+GET_CATEGORY, GET_ITEM_TITLE, GET_SPECS, GET_DESCRIPTION, GET_CONDITION, GET_PRICE, GET_PHOTOS, GET_LOCATION, GET_AVAILABILITY, BROWSE_SEARCH = range(10)
 
-EDIT_DESCRIPTION,EDIT_CHOICE, CONFIRM_DELETE, AWAIT_NEW_DESCRIPTION, AWAIT_NEW_PRICE, AWAIT_NEW_LOCATION, AWAIT_NEW_CATEGORY, AWAIT_NEW_CONDITION, AWAIT_NEW_ITEM_TITLE, AWAIT_NEW_BRAND_MODEL, AWAIT_NEW_SPECS, AWAIT_NEW_TAGS = range(100, 112)  # Avoid overlap with existing states
+EDIT_DESCRIPTION,EDIT_CHOICE, CONFIRM_DELETE, AWAIT_NEW_DESCRIPTION, AWAIT_NEW_PRICE, AWAIT_NEW_LOCATION, AWAIT_NEW_CATEGORY, AWAIT_NEW_CONDITION, AWAIT_NEW_ITEM_TITLE, AWAIT_NEW_BRAND_MODEL, AWAIT_NEW_SPECS = range(100, 111)  # Avoid overlap with existing states
 
 AWAIT_SEARCH_QUERY, SETTINGS_MENU, AWAIT_LOCATION_CHOICE = range(300, 303)
 
@@ -55,6 +57,115 @@ AWAIT_SEARCH_QUERY, SETTINGS_MENU, AWAIT_LOCATION_CHOICE = range(300, 303)
 geolocator = Nominatim(user_agent="taxitool_bot", timeout=5)
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, max_retries=2)
 reverse = RateLimiter(geolocator.reverse, min_delay_seconds=1, max_retries=2)
+_MD2_SPECIAL = r'[_*[\]()~`>#+\-=|{}.!]'
+
+def nz(x) -> str:
+    """None-safe to-string (None -> '', preserves strings)."""
+    if x is None:
+        return ""
+    return x if isinstance(x, str) else str(x)
+
+async def edit_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    listing_id = context.user_data.get("edit_listing_id")
+    if not listing_id:
+        await q.message.edit_text("No listing in context.")
+        return ConversationHandler.END
+
+    keyboard = [
+        [InlineKeyboardButton("📂 Category", callback_data="edit_field_category")],
+        [InlineKeyboardButton("📝 Item title", callback_data="edit_field_item")],
+        [InlineKeyboardButton("🏷 Brand/Model", callback_data="edit_field_brand_model")],
+        [InlineKeyboardButton("⚙️ Specs", callback_data="edit_field_specs")],
+        [InlineKeyboardButton("✏️ Description", callback_data="edit_field_description")],
+        [InlineKeyboardButton("🛠 Condition", callback_data="edit_field_condition")],
+        [InlineKeyboardButton("💰 Price", callback_data="edit_field_price")],
+        [InlineKeyboardButton("📍 Location", callback_data="edit_field_location")],
+        [InlineKeyboardButton("🔙 Back", callback_data="cancel_edit")]
+    ]
+    await q.message.edit_text("What would you like to edit?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return EDIT_CHOICE
+
+def esc_md2(s: str | None) -> str:
+    if s is None:
+        return ""
+    return re.sub(f"({_MD2_SPECIAL})", r"\\\1", str(s))
+
+def _to_iso_list(tokens: list[str]) -> list[str]:
+    """Normalize any 'YYYY-MM-DD' or 'DD/MM/YYYY' tokens to ISO 'YYYY-MM-DD'."""
+    out = []
+    for t in tokens or []:
+        d = _parse_date_any(t)
+        if d:
+            out.append(d.strftime("%Y-%m-%d"))
+    return out
+
+def _ranges_from_iso(iso_dates: list[str]) -> tuple[str, int]:
+    """
+    Collapse ISO dates into human-friendly ranges.
+    Returns (pretty_string, total_day_count).
+    """
+    if not iso_dates:
+        return "—", 0
+    days = sorted(datetime.strptime(x, "%Y-%m-%d").date() for x in iso_dates)
+    total = len(days)
+
+    ranges = []
+    start = end = days[0]
+    for d in days[1:]:
+        if d == end + timedelta(days=1):
+            end = d
+        else:
+            ranges.append((start, end))
+            start = end = d
+    ranges.append((start, end))
+
+    pretty = ", ".join(
+        f"{a.strftime('%d/%m/%Y')}" + (f" - {b.strftime('%d/%m/%Y')}" if a != b else "")
+        for a, b in ranges
+    )
+    return pretty, total
+
+def format_date_ranges_from_tokens(tokens: list[str]) -> str:
+    """
+    Takes a list of date tokens ('YYYY-MM-DD' or 'DD/MM/YYYY') and returns
+    collapsed ranges in 'DD/MM/YYYY - DD/MM/YYYY' format, one per line.
+    """
+    # Parse & sort to date
+    parsed = []
+    for t in tokens or []:
+        d = _parse_date_any(t)
+        if d:
+            parsed.append(d)
+    if not parsed:
+        return "Not provided"
+    parsed = sorted(set(parsed))
+    # Collapse consecutive dates
+    blocks = []
+    start = end = parsed[0]
+    for d in parsed[1:]:
+        if d == end + timedelta(days=1):
+            end = d
+        else:
+            blocks.append((start, end))
+            start = end = d
+    blocks.append((start, end))
+    # Render as DD/MM/YYYY - DD/MM/YYYY
+    return "\n".join(f"{s.strftime('%d/%m/%Y')} - {e.strftime('%d/%m/%Y')}" for s, e in blocks)
+
+def _in_next_n_days(d: date, n: int = 30) -> bool:
+    today = datetime.utcnow().date()
+    return today <= d <= (today + timedelta(days=n))
+
+def _count_bookable_days_next_30(listing: dict) -> int:
+    free = _collect_available_days(listing)  # tokens in source format
+    count = 0
+    for t in free:
+        d = _parse_date_any(t)
+        if d and _in_next_n_days(d, 30):
+            count += 1
+    return count
 
 def location_name_from_coords(input_str):
     try:
@@ -82,6 +193,27 @@ def location_name_from_coords(input_str):
         print(f"[Geo Error] {e}")
         return input_str  # fallback to original input
 
+def coerce_list(v):
+    """Return a list for DB fields that may arrive as list, JSON string, comma string or None."""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() in {"", "none", "null", "nan"}:
+            return []
+        # JSON array?
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                return [str(x).strip() for x in arr if str(x).strip()]
+            except Exception:
+                pass
+        # Fallback: comma-separated
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return []
+
 def _parse_date_any(fmt_str: str) -> date | None:
     """Accepts either DD/MM/YYYY or YYYY-MM-DD; returns date or None."""
     s = fmt_str.strip()
@@ -105,6 +237,23 @@ def _collect_available_days(listing: dict) -> set[str]:
     booked = {_fmt_like_source(_parse_date_any(b), avail_raw) for b in booked_raw if _parse_date_any(b)}
     return {d for d in avail if d not in booked}
 
+def _group_available_by_year_month(listing: dict) -> dict[int, dict[int, list[tuple[int, str]]]]:
+    """
+    Returns {year: {month: [(day, token), ...]}} where token is the original date
+    string from availability (e.g., '2025-10-12' or '12/10/2025').
+    Sorted by day within each month.
+    """
+    by: dict[int, dict[int, list[tuple[int, str]]]] = {}
+    for token in _collect_available_days(listing):
+        d = _parse_date_any(token)
+        if not d:
+            continue
+        by.setdefault(d.year, {}).setdefault(d.month, []).append((d.day, token))
+    for y in by:
+        for m in by[y]:
+            by[y][m].sort(key=lambda t: t[0])
+    return by
+
 def _split_week_ranges(year: int, month: int) -> list[tuple[int, int]]:
     """1–7, 8–14, 15–21, 22–lastDay for that month."""
     last_day = monthrange(year, month)[1]
@@ -127,6 +276,90 @@ def _get_selected_days(context: ContextTypes.DEFAULT_TYPE, listing_id: str) -> l
 def _clear_selected_days(context: ContextTypes.DEFAULT_TYPE, listing_id: str):
     context.user_data.pop(f"rent_selected_{listing_id}", None)
 
+# === Moderation ===
+BAD_WORDS = {
+    "porn", "porno", "pornography", "xxx", "nsfw", "nude", "nudity", "stripper",
+    "sex", "sexual", "blowjob", "handjob", "cum", "ejaculate", "rape", "rapist",
+    "pedo", "pedophile", "child porn", "incest", "bestiality",
+    "kill", "murder", "behead", "suicide", "self harm"
+}
+_bad_word_re = re.compile(r"\b(" + "|".join(re.escape(w) for w in BAD_WORDS) + r")\b", re.I)
+
+def _bad_word_hit(text: str) -> bool:
+    return bool(_bad_word_re.search(text or ""))
+
+async def moderate_text(text: str) -> tuple[bool, str]:
+    """
+    Returns (ok, reason). Uses OpenAI moderation; falls back to a local wordlist.
+    """
+    try:
+        resp = client.moderations.create(
+            model="omni-moderation-latest",
+            input=text[:5000] if text else ""  # safety: cap length
+        )
+        res = resp.results[0]
+        if getattr(res, "flagged", False):
+            # Build a short reason from tripped categories, if available
+            cats = []
+            try:
+                cats = [k for k, v in res.categories.items() if v]  # best effort
+            except Exception:
+                pass
+            return False, ("Inappropriate content" + (f" ({', '.join(cats)})" if cats else ""))
+    except Exception as e:
+        logging.warning(f"[moderation] text API failed: {e}")
+
+    # Fallback wordlist
+    if _bad_word_hit(text or ""):
+        return False, "Inappropriate content (word filter)"
+    return True, ""
+
+async def moderate_telegram_photo(file_id: str, bot) -> tuple[bool, str]:
+    """
+    Downloads the Telegram photo, sends it to a small vision moderation check.
+    Protocol: strict 'OK' or 'BLOCK:<reason>'.
+    """
+    try:
+        tg_file = await bot.get_file(file_id)
+        tmp_path = f"/tmp/{file_id}.jpg"
+        await tg_file.download_to_drive(tmp_path)
+
+        with open(tmp_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Use a small model to classify; response format we enforce is 'OK' or 'BLOCK: ...'
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content":
+                    "You are a strict content safety classifier. "
+                    "Given an image, output EXACTLY 'OK' if it is safe for a general audience. "
+                    "Output 'BLOCK:<short reason>' if it contains nudity/sexual content (especially minors), "
+                    "graphic violence/gore, hate symbols, illegal activity, or other unsafe content."
+                },
+                {"role": "user", "content": [
+                    {"type": "input_text",
+                     "text": "Does this image violate safe-for-work standards? Classify strictly."},
+                    {"type": "input_image",
+                     "image_url": f"data:image/jpeg;base64,{b64}"}
+                ]}
+            ]
+        )
+        decision = (resp.choices[0].message.content or "").strip()
+        if decision.upper().startswith("OK"):
+            return True, ""
+        if decision.upper().startswith("BLOCK"):
+            # keep reason short
+            reason = decision.split(":", 1)[1].strip() if ":" in decision else "Unsafe image"
+            return False, reason
+    except Exception as e:
+        logging.warning(f"[moderation] image moderation failed: {e}")
+        # If moderation is unavailable, be conservative? You can choose False to be strict.
+        # Here we'll be conservative but not blocking uploads due to temporary errors:
+        return True, ""
+    return True, ""
+
 # === Start Command ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -139,17 +372,439 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "display_name": user.first_name
         }).execute()
 
-    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
+    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"]]
     await update.message.reply_text(
-        "Hi! I'm RentoTo bot — your tool-sharing assistant. You can rent tools from others or list your own.",
+        "Hi! I'm RentoTo — your tool-sharing assistant. You can rent tools from others or list your own.",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
 # === Back to Menu ===
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
+    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"]]
     await update.message.reply_text("Main Menu:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return ConversationHandler.END
+
+# === My Account ===
+async def handle_my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = str(update.effective_user.id)
+
+    # Listings of this lender
+    listings = supabase.table("listings").select("*").eq("owner_id", me).execute().data or []
+    listing_ids = [l["id"] for l in listings]
+
+    # Pending + accepted requests
+    pending = []
+    accepted = []
+    if listing_ids:
+        # pending
+        pending = supabase.table("rental_requests").select("*").in_("listing_id", listing_ids)\
+                 .eq("lender_id", me).eq("status", "pending").execute().data or []
+        # accepted
+        accepted = supabase.table("rental_requests").select("*").in_("listing_id", listing_ids)\
+                   .eq("lender_id", me).eq("status", "accepted").execute().data or []
+
+    # Stats
+    total_listings = len(listings)
+    pending_count = len(pending)
+
+    # Upcoming bookings = accepted requests with any date >= today
+    today = datetime.utcnow().date()
+    def _any_upcoming(rr):
+        return any((_parse_date_any(t) or date.min) >= today for t in rr.get("dates", []))
+    upcoming_count = sum(1 for rr in accepted if _any_upcoming(rr))
+
+    # Bookable days next 30
+    bookable_30 = sum(_count_bookable_days_next_30(l) for l in listings)
+
+    # Estimated earnings next 30 by currency
+    listing_by_id = {l["id"]: l for l in listings}
+    earn_by_cur: dict[str, float] = {}
+
+    for rr in accepted:
+        l = listing_by_id.get(rr["listing_id"])
+        if not l:
+            continue
+        cur = (l.get("currency") or "PLN").upper()
+        p = float(l.get("price_per_day") or 0)
+        for t in rr.get("dates", []):
+            d = _parse_date_any(t)
+            if d and _in_next_n_days(d, 30):
+                earn_by_cur[cur] = round(earn_by_cur.get(cur, 0.0) + p, 2)
+
+    if earn_by_cur:
+        earn_lines = "\n".join(f"• {amt:.2f} {cur}" for cur, amt in earn_by_cur.items())
+    else:
+        earn_lines = "• 0"
+
+    text = (
+        "👤 *My Account*\n\n"
+        f"📦 Your listings: *{total_listings}*\n"
+        f"⏳ Pending requests: *{pending_count}*\n"
+        f"📅 Upcoming bookings: *{upcoming_count}*\n"
+        f"🗓 Bookable days (next 30d): *{bookable_30}*\n"
+        f"💰 Est. earnings (next 30d):\n{earn_lines}"
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📬 Check outstanding requests", callback_data="account_requests")],
+        [InlineKeyboardButton("📅 Upcoming borrowings",        callback_data="my_borrowings")]
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+async def account_my_borrowings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    me = str(update.effective_user.id)
+
+    # Accepted requests where I'm the borrower
+    rrs = supabase.table("rental_requests")\
+        .select("listing_id, dates, status")\
+        .eq("borrower_id", me).eq("status", "accepted")\
+        .execute().data or []
+
+    if not rrs:
+        await q.message.edit_text("You have no upcoming borrowings")
+        return
+
+    # Gather upcoming days per listing
+    today = datetime.utcnow().date()
+    by_listing: dict[str, set[str]] = {}
+    for rr in rrs:
+        keep = []
+        for t in rr.get("dates") or []:
+            d = _parse_date_any(t)
+            if d and d >= today:
+                keep.append(d.strftime("%Y-%m-%d"))
+        if keep:
+            by_listing.setdefault(rr["listing_id"], set()).update(keep)
+
+    if not by_listing:
+        await q.message.edit_text("You have no upcoming borrowings")
+        return
+
+    # Fetch listings and owners
+    listing_ids = list(by_listing.keys())
+    listings = supabase.table("listings").select("id,item,description,owner_id").in_("id", listing_ids).execute().data or []
+    by_id = {l["id"]: l for l in listings}
+
+    owner_ids = list({l["owner_id"] for l in listings if l.get("owner_id")})
+    owners = supabase.table("users").select("id,telegram_username").in_("id", owner_ids).execute().data or []
+    owner_name = {u["id"]: (u.get("telegram_username") or "") for u in owners}
+
+    blocks = []
+    for lid, days in by_listing.items():
+        l = by_id.get(lid)
+        if not l: 
+            continue
+        item_e = esc_md2(l.get("item") or "Item")
+        desc_e = esc_md2(l.get("description") or "")
+        lender_un = owner_name.get(l.get("owner_id", ""), "")
+        lender_tag = esc_md2(f"@{lender_un}") if lender_un else esc_md2("No public username")
+        ranges_str = format_date_ranges_from_tokens(sorted(days))
+        ranges_e = esc_md2(ranges_str)
+
+        block = (
+            f"🏷️ *{item_e}*\n"
+            f"📄 {desc_e}\n"
+            f"👤 From: {lender_tag}\n"
+            f"🗓 When:\n{ranges_e}"
+        )
+        blocks.append(block)
+
+    # when empty:
+    if not rrs:
+        await q.message.edit_text(
+            "You have no upcoming borrowings",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="account_overview")]])
+        )
+        return
+
+    if not by_listing:
+        await q.message.edit_text(
+            "You have no upcoming borrowings",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="account_overview")]])
+        )
+        return
+
+    # final render:
+    text = "📅 *Your upcoming borrowings*\n\n" + "\n\n".join(blocks)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="account_overview")]])
+    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+
+async def account_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    me = str(update.effective_user.id)
+
+    # ==== same stats logic as handle_my_account() ====
+    listings = supabase.table("listings").select("*").eq("owner_id", me).execute().data or []
+    listing_ids = [l["id"] for l in listings]
+    pending = accepted = []
+    if listing_ids:
+        pending = supabase.table("rental_requests").select("*").in_("listing_id", listing_ids)\
+                 .eq("lender_id", me).eq("status", "pending").execute().data or []
+        accepted = supabase.table("rental_requests").select("*").in_("listing_id", listing_ids)\
+                   .eq("lender_id", me).eq("status", "accepted").execute().data or []
+
+    today = datetime.utcnow().date()
+    def _any_upcoming(rr): return any((_parse_date_any(t) or date.min) >= today for t in rr.get("dates", []))
+    upcoming_count = sum(1 for rr in accepted if _any_upcoming(rr))
+    total_listings = len(listings)
+    pending_count = len(pending)
+    bookable_30 = sum(_count_bookable_days_next_30(l) for l in listings)
+
+    listing_by_id = {l["id"]: l for l in listings}
+    earn_by_cur = {}
+    for rr in accepted:
+        l = listing_by_id.get(rr["listing_id"]); 
+        if not l: continue
+        cur = (l.get("currency") or "PLN").upper()
+        p = float(l.get("price_per_day") or 0)
+        for t in rr.get("dates", []):
+            d = _parse_date_any(t)
+            if d and d >= today and d <= today + timedelta(days=30):
+                earn_by_cur[cur] = round(earn_by_cur.get(cur, 0.0) + p, 2)
+    earn_lines = "\n".join(f"• {amt:.2f} {cur}" for cur, amt in earn_by_cur.items()) if earn_by_cur else "• 0"
+
+    text = (
+        "👤 *My Account*\n\n"
+        f"📦 Your listings: *{total_listings}*\n"
+        f"⏳ Pending requests: *{pending_count}*\n"
+        f"📅 Upcoming bookings: *{upcoming_count}*\n"
+        f"🗓 Bookable days (next 30d): *{bookable_30}*\n"
+        f"💰 Est. earnings (next 30d):\n{earn_lines}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📬 Check outstanding requests", callback_data="account_requests")],
+        [InlineKeyboardButton("📅 Upcoming borrowings",        callback_data="my_borrowings")]
+    ])
+    await q.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
+async def account_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    me = str(update.effective_user.id)
+
+    # Load my pending requests (lender)
+    rr = supabase.table("rental_requests").select("*").eq("lender_id", me).eq("status", "pending")\
+         .order("created_at", desc=False).execute().data or []
+    if not rr:
+        await q.message.edit_text(
+            "🎉 No outstanding requests right now.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="account_overview")]])
+        )
+        return
+
+    # Fetch listings for enrichment (titles/prices)
+    listing_ids = list({x["listing_id"] for x in rr})
+    listings = supabase.table("listings").select("*").in_("id", listing_ids).execute().data or []
+    by_id = {l["id"]: l for l in listings}
+    enriched = []
+    for r in rr:
+        l = by_id.get(r["listing_id"])
+        if l:
+            r["_listing"] = l
+            enriched.append(r)
+
+    context.user_data["pending_reqs"] = enriched
+    context.user_data["pending_req_idx"] = 0
+    await _show_request_card(q, context)
+
+async def account_req_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    arr = context.user_data.get("pending_reqs", [])
+    if not arr:
+        await q.message.edit_text("No requests.")
+        return
+    context.user_data["pending_req_idx"] = (context.user_data.get("pending_req_idx", 0) + 1) % len(arr)
+    await _show_request_card(q, context)
+
+async def account_req_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    arr = context.user_data.get("pending_reqs", [])
+    if not arr:
+        await q.message.edit_text("No requests.")
+        return
+    context.user_data["pending_req_idx"] = (context.user_data.get("pending_req_idx", 0) - 1) % len(arr)
+    await _show_request_card(q, context)
+
+async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    q = getattr(update_or_query, "callback_query", None) or update_or_query
+    arr = context.user_data.get("pending_reqs", [])
+    idx = context.user_data.get("pending_req_idx", 0)
+    if not arr:
+        await q.message.edit_text("🎉 No outstanding requests right now.")
+        return
+
+    req = arr[idx]
+    l = req["_listing"]
+    currency = l.get("currency", "PLN")
+    price_per_day = float(l.get("price_per_day") or 0)
+    days = len(req.get("dates", []))
+    total = round(price_per_day * days, 2)
+
+    # Escape dynamic bits for MarkdownV2
+    category = esc_md2(l.get("category", ""))
+    item = esc_md2(l.get("item") or "Item")
+    dates_block = esc_md2(format_date_ranges_from_tokens(req.get("dates", [])))
+    currency_e = esc_md2(currency)
+    price_per_day_str = esc_md2(f"{price_per_day:.2f}")
+    total_str = esc_md2(f"{total:.2f}")
+
+    # NEW: show borrower's browse input (if any); username is hidden here
+    note = req.get("message_from_borrower") or ""
+    note_e = esc_md2(note) if note else "—"
+
+    text = (
+        f"📬 *Request {idx+1} of {len(arr)}*\n\n"
+        f"🧰 *{category}*\n"
+        f"🏷️ *{item}*\n"
+        f"📝 Borrower’s request: {note_e}\n"
+        f"📅\n{dates_block}\n"
+        f"💰 {price_per_day_str} {currency_e}/day · Total: {total_str} {currency_e}"
+    )
+
+    nav = []
+    if len(arr) > 1:
+        nav = [InlineKeyboardButton("⬅️ Prev", callback_data="account_req_prev"),
+               InlineKeyboardButton("➡️ Next", callback_data="account_req_next")]
+
+    # Removed "Message borrower" button and Request ID disclosure
+    kb = [
+        [InlineKeyboardButton("✅ Accept", callback_data=f"req_accept_{req['id']}"),
+        InlineKeyboardButton("❌ Decline", callback_data=f"req_decline_{req['id']}")]
+    ]
+    if nav:
+        kb.append(nav)
+    # add Back row
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="account_overview")])
+
+    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
+
+async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    req_id = q.data.split("_", 2)[2]
+
+    rr_list = supabase.table("rental_requests").select("*").eq("id", req_id).execute().data
+    if not rr_list:
+        await q.message.edit_text(
+            "Request not found.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to requests", callback_data="account_requests")]])
+        )
+        return
+    rr = rr_list[0]
+
+    listing = supabase.table("listings").select("*").eq("id", rr["listing_id"]).execute().data[0]
+    requested = rr.get("dates", []) or []
+
+    # update request status
+    supabase.table("rental_requests").update({"status": "accepted"}).eq("id", req_id).execute()
+
+    # mark booked days on listing
+    booked = (listing.get("booked_days") or [])
+    new_booked = sorted(set(booked) | set(_to_iso_list(requested)))
+    supabase.table("listings").update({"booked_days": new_booked}).eq("id", listing["id"]).execute()
+
+    # prepare confirmation for the UI card
+    currency = (listing.get("currency") or "PLN").upper()
+    price_per_day = float(listing.get("price_per_day") or 0)
+    total = round(price_per_day * len(requested), 2)
+    pretty_ranges = format_date_ranges_from_tokens(requested)
+
+    item_e   = esc_md2(listing.get('item') or 'Item')
+    ranges_e = esc_md2(pretty_ranges)
+    cur_e    = esc_md2(currency)
+    tot_e    = esc_md2(f"{total:.2f}")
+
+    await q.message.edit_text(
+        "✅ Request accepted and days booked\\.\n\n"
+        f"🏷️ *{item_e}*\n"
+        f"📅\n{ranges_e}\n"
+        f"💰 Total: {tot_e} {cur_e}",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to requests", callback_data="account_requests")]])
+    )
+
+    # Notify borrower (safe MarkdownV2 – no tg:// link here)
+    try:
+        await context.bot.send_message(
+            chat_id=int(rr["borrower_id"]),
+            text=(
+                "🎉 *Accepted!*\n\n"
+                f"🏷️ *{item_e}*\n"
+                f"📅\n{ranges_e}\n"
+                f"💰 Total: {tot_e} {cur_e}"
+            ),
+            parse_mode="MarkdownV2"
+        )
+    except Exception as e:
+        logging.warning(f"Failed to notify borrower: {e}")
+
+    # NEW: Tell the lender who the borrower is *now*, with a friendly nudge to chat
+    try:
+        lender_chat_id = int(listing["owner_id"])
+        borrower_username = (rr.get("borrower_username") or "").strip()
+
+        if borrower_username:
+            at_tag_e = esc_md2(f"@{borrower_username}")
+            msg = (
+                f"🙌 Nice! The borrower is {at_tag_e}\\.\n\n"
+                "Great\\! Now text the borrower to agree on a convenient pickup time and place\\.\n"
+                "A quick hello goes a long way 🙂"
+            )
+            await context.bot.send_message(chat_id=lender_chat_id, text=msg, parse_mode="MarkdownV2")
+        else:
+            # keep this one WITHOUT parse_mode so tg:// doesn't need escaping
+            fallback = (
+                "🙌 Nice! The borrower doesn’t have a public @username.\n\n"
+                "Great! Now text the borrower to agree on a convenient pickup time and place:\n"
+                f"tg://user?id={rr['borrower_id']}"
+            )
+            await context.bot.send_message(chat_id=lender_chat_id, text=fallback)
+
+    except Exception as e:
+        logging.warning(f"Failed to notify lender with borrower tag: {e}")
+
+async def handle_request_decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    req_id = q.data.split("_", 2)[2]
+
+    rr_list = supabase.table("rental_requests").select("*").eq("id", req_id).execute().data
+    if not rr_list:
+        await q.message.edit_text(
+            "Request not found",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Back to requests", callback_data="account_requests")]]
+            ),
+        )
+        return
+    rr = rr_list[0]
+
+    supabase.table("rental_requests").update({"status": "declined"}).eq("id", req_id).execute()
+
+    await q.message.edit_text(
+        "❌ Request declined",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back to requests", callback_data="account_requests")]]
+        ),
+    )
+
+    # Try to notify borrower (escape item name)
+    try:
+        listing = supabase.table("listings").select("item").eq("id", rr["listing_id"]).execute().data[0]
+        item_e = esc_md2((listing or {}).get("item") or "Item")
+        await context.bot.send_message(
+            chat_id=int(rr["borrower_id"]),
+            text=f"😕 Your request for *{item_e}* was declined",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logging.warning(f"Failed to notify borrower about decline: {e}")
 
 # === Settings ===
 async def save_location_from_gps(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,6 +882,7 @@ async def handle_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_query = update.message.text
+    context.user_data["last_search_query"] = user_query
     user_id = str(update.effective_user.id)
 
     prompt = f"""
@@ -315,6 +971,18 @@ async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     matched_listings = match_resp.data or []
+    
+    # 🔎 DEBUG: see what columns the RPC returned
+    if matched_listings:
+        logging.info("[BROWSE DEBUG] RPC keys: %s", list(matched_listings[0].keys()))
+
+    # ⬇️ Rehydrate with full records so 'item' and 'specs' are present
+    ids = [r["id"] for r in matched_listings]
+    if ids:
+        full = supabase.table("listings").select("*").in_("id", ids).execute().data or []
+        by_id = {r["id"]: r for r in full}
+        matched_listings = [by_id[i] for i in ids if i in by_id]
+
     for i, l in enumerate(matched_listings):
         print(f"{i+1}. {l.get('description','')} → similarity: {round(l.get('similarity', 0), 3)}")
 
@@ -359,11 +1027,23 @@ async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def browse_next_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["browse_index"] += 1
+    q = update.callback_query
+    await q.answer()
+    listings = context.user_data.get("matched_listings", [])
+    if not listings:
+        await q.message.edit_text("No results to browse.")
+        return
+    context.user_data["browse_index"] = (context.user_data.get("browse_index", 0) + 1) % len(listings)
     await send_browse_listing(update, context)
 
 async def browse_prev_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["browse_index"] -= 1
+    q = update.callback_query
+    await q.answer()
+    listings = context.user_data.get("matched_listings", [])
+    if not listings:
+        await q.message.edit_text("No results to browse.")
+        return
+    context.user_data["browse_index"] = (context.user_data.get("browse_index", 0) - 1) % len(listings)
     await send_browse_listing(update, context)
 
 async def send_browse_listing(update_or_query, context):
@@ -373,32 +1053,72 @@ async def send_browse_listing(update_or_query, context):
         return
 
     listing = listings[index]
-    photos = listing.get("photos") or []
-    title = listing.get("item") or listing.get("description", "Item")
-    brand_model = listing.get("brand_model")
-    specs = listing.get("specs") or []
-    tags = listing.get("tags") or []
+    # Quick wordlist guard for legacy content (optional)
+    joined_text = " ".join(filter(None, [
+        nz(listing.get("category")),
+        nz(listing.get("item")),
+        ", ".join(coerce_list(listing.get("specs"))),
+        nz(listing.get("description")),
+        nz(listing.get("condition")),
+        location_name_from_coords(nz(listing.get("location"))),
+    ])).strip()
+    if _bad_word_hit(joined_text):
+        # Skip this listing by auto-advancing; if all are bad, it will just show none.
+        nxt = index + 1
+        context.user_data["browse_index"] = nxt
+        if nxt < len(listings):
+            return await send_browse_listing(update_or_query, context)
+        else:
+            # At end; quietly refuse to render
+            return
 
-    extra = ""
-    if brand_model:
-        extra += f"\n🏷 Brand/Model: {brand_model}"
-    if specs:
-        extra += f"\n⚙️ Specs: {', '.join(specs[:4])}"
-    if tags:
-        extra += f"\n🏷 Tags: {', '.join(tags[:5])}"
+    photos = coerce_list(listing.get("photos"))
+    title  = listing.get("item") or "Item"
+    specs  = coerce_list(listing.get("specs"))
+    cur    = listing.get("currency", "PLN")
+
+    def format_availability(dates):
+        if not dates:
+            return "Not provided"
+        dates = sorted(dates)
+        result = []
+        current_start = current_end = datetime.strptime(dates[0], "%Y-%m-%d")
+        for d in dates[1:]:
+            d_parsed = datetime.strptime(d, "%Y-%m-%d")
+            if d_parsed == current_end + timedelta(days=1):
+                current_end = d_parsed
+            else:
+                result.append(f"{current_start.strftime('%d/%m/%Y')} - {current_end.strftime('%d/%m/%Y')}")
+                current_start = current_end = d_parsed
+        result.append(f"{current_start.strftime('%d/%m/%Y')} - {current_end.strftime('%d/%m/%Y')}")
+        return "\n".join(result)
+
+    availability_str = format_availability(listing.get("availability"))
+
+    # escape AFTER availability_str is built
+    cat_e   = esc_md2(listing.get('category', ''))
+    title_e = esc_md2(title)
+    specs_e = esc_md2(", ".join(specs[:4])) if specs else ""
+    desc_e  = esc_md2(listing.get('description', ''))
+    cond_e  = esc_md2(listing.get('condition', 'Not specified'))
+    price_e = esc_md2(f"{float(listing.get('price_per_day', 0)):.2f}")
+    cur_e   = esc_md2(cur)
+    loc_e   = esc_md2(location_name_from_coords(listing['location']))
+    avail_e = esc_md2(availability_str)
 
     msg = (
-        f"🧰 *{listing['category']}* — *{title}*\n"
-        f"📄 {listing['description']}\n"
-        f"📦 Condition: {listing.get('condition', 'Not specified')}\n"
-        f"💰 {listing['price_per_day']} PLN/day\n"
-        f"📍 Location: {location_name_from_coords(listing['location'])}"
-        f"{extra}"
+        f"🧰 *{cat_e}*\n"
+        f"🏷️ *{title_e}*\n"
+        + (f"🔧 {specs_e}\n" if specs_e else "")
+        + f"📄 {desc_e}\n"
+        + f"📦 Condition: {cond_e}\n"
+        + f"💰 {price_e} {cur_e}/day\n"
+        + f"📍 Location: {loc_e}\n"
+        + f"📅 Availability:\n{avail_e}"
     )
+    # ... keep the rest, but ensure parse_mode="MarkdownV2" in both branches
 
-    # ✅ define chat first
-    chat = update_or_query.effective_chat
-
+    # Buttons
     buttons = []
     if index > 0:
         buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data="browse_prev"))
@@ -407,34 +1127,44 @@ async def send_browse_listing(update_or_query, context):
         buttons.append(InlineKeyboardButton("➡️ Next", callback_data="browse_next"))
     reply_markup = InlineKeyboardMarkup([buttons])
 
+    # --- Callback case (Next/Prev): delete old media + text, then re-send like before ---
     if update_or_query.callback_query:
         query = update_or_query.callback_query
         await query.answer()
+        chat = query.message.chat
+
+        # delete old media group
         for msg_id in context.user_data.get("browse_media_ids", []):
             try:
-                await context.bot.delete_message(chat.id, msg_id)
-            except:
-                pass
-        try:
-            await query.message.delete()
-        except:
-            pass
-    else:
+                await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+            except Exception as e:
+                print(f"[browse] failed to delete media {msg_id}: {e}")
         context.user_data["browse_media_ids"] = []
 
-    if photos:
-        media_group = await context.bot.send_media_group(
-            chat_id=chat.id,
-            media=[InputMediaPhoto(p) for p in photos[:3]]
-        )
-        context.user_data["browse_media_ids"] = [m.message_id for m in media_group]
+        # delete old text message
+        try:
+            await query.message.delete()
+        except Exception as e:
+            print(f"[browse] failed to delete text message: {e}")
 
-    await context.bot.send_message(
-        chat_id=chat.id,
-        text=msg,
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
+        # send photos (like before)
+        if photos:
+            media_group = await chat.send_media_group([InputMediaPhoto(p) for p in photos[:3]])
+            context.user_data["browse_media_ids"] = [m.message_id for m in media_group]
+        else:
+            context.user_data["browse_media_ids"] = []
+
+        # send text card
+        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+
+    # --- First render (message case): reply with media group + text, store IDs for later deletion ---
+    else:
+        context.user_data["browse_media_ids"] = []
+        if photos:
+            media_messages = await update_or_query.message.reply_media_group([InputMediaPhoto(p) for p in photos[:3]])
+            context.user_data["browse_media_ids"] = [m.message_id for m in media_messages]
+        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+
 
 # === View My Listings ===
 async def send_single_listing(update_or_query, context):
@@ -445,7 +1175,7 @@ async def send_single_listing(update_or_query, context):
         return
 
     listing = listings[index]
-    photos = listing.get("photos") or []
+    photos = coerce_list(listing.get("photos"))
 
     def format_availability(dates):
         if not dates:
@@ -467,15 +1197,27 @@ async def send_single_listing(update_or_query, context):
         return "\n".join(result)
 
     availability_str = format_availability(listing.get("availability"))
-
-
+    title = listing.get("item") or "Item"
+    specs = coerce_list(listing.get("specs"))
+    cur = listing.get("currency", "PLN")
+    cat_e   = esc_md2(listing.get('category', ''))
+    title_e = esc_md2(title)
+    specs_e = esc_md2(", ".join(specs[:4])) if specs else ""
+    desc_e  = esc_md2(listing.get('description', ''))
+    cond_e  = esc_md2(listing.get('condition', 'Not specified'))
+    price_e = esc_md2(f"{float(listing.get('price_per_day', 0)):.2f}")
+    cur_e   = esc_md2(cur)
+    loc_e   = esc_md2(location_name_from_coords(listing['location']))
+    avail_e = esc_md2(availability_str)
     msg = (
-        f"🧰 *{listing['category']}*\n"
-        f"📄 {listing['description']}\n"
-        f"📦 Condition: {listing['condition']}\n"
-        f"💰 {listing['price_per_day']} PLN/day\n"
-        f"📍 Location: {location_name_from_coords(listing['location'])}\n"
-        f"📅 Availability:\n{availability_str}"
+        f"🧰 *{cat_e}*\n"
+        f"🏷️ *{title_e}*\n"
+        + (f"🔧 {specs_e}\n" if specs_e else "")
+        + f"📄 {desc_e}\n"
+        + f"📦 Condition: {cond_e}\n"
+        + f"💰 {price_e} {cur_e}/day\n"
+        + f"📍 Location: {loc_e}\n"
+        + f"📅 Availability:\n{avail_e}"
     )
 
     buttons = []
@@ -489,8 +1231,10 @@ async def send_single_listing(update_or_query, context):
         InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{listing['id']}"),
         InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{listing['id']}")
     ]
+    
+    schedule_row = [InlineKeyboardButton("📆 Lending schedule", callback_data=f"schedule_{listing['id']}")]
 
-    reply_markup = InlineKeyboardMarkup([nav_row, edit_row])
+    reply_markup = InlineKeyboardMarkup([nav_row, edit_row, schedule_row])
 
     # Handle CallbackQuery
     if update_or_query.callback_query:
@@ -519,11 +1263,7 @@ async def send_single_listing(update_or_query, context):
             context.user_data["last_media_messages"] = [m.message_id for m in media_group]
 
         # 📝 Send new text block
-        await chat.send_message(
-            text=msg,
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
         
     # Handle Message (initial case)
     elif update_or_query.message:
@@ -533,11 +1273,84 @@ async def send_single_listing(update_or_query, context):
         else:
             context.user_data["last_media_messages"] = []
 
-        await update_or_query.message.reply_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=reply_markup
+        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+
+async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    listing_id = q.data.split("_", 1)[1]
+
+    # Get listing (name + description)
+    listing = supabase.table("listings").select("item,description").eq("id", listing_id).execute().data
+    if not listing:
+        await q.message.edit_text("Listing not found")
+        return
+    listing = listing[0]
+
+    # Get accepted requests for this listing
+    rrs = supabase.table("rental_requests")\
+        .select("borrower_id, borrower_username, dates, status")\
+        .eq("listing_id", listing_id).eq("status", "accepted")\
+        .execute().data or []
+
+    today = datetime.utcnow().date()
+    # Group upcoming days per borrower
+    by_borrower: dict[str, dict] = {}
+    for rr in rrs:
+        all_days = rr.get("dates") or []
+        upcoming = []
+        for t in all_days:
+            d = _parse_date_any(t)
+            if d and d >= today:
+                upcoming.append(d.strftime("%Y-%m-%d"))
+        if not upcoming:
+            continue
+        k = rr["borrower_id"]
+        g = by_borrower.setdefault(k, {"username": rr.get("borrower_username") or "", "dates": set()})
+        g["dates"].update(upcoming)
+
+    if not by_borrower:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"schedule_back_{listing_id}")]])
+        await q.message.edit_text("📆 No upcoming rentals for this listing", reply_markup=kb)
+        return
+
+    item_e = esc_md2(listing.get("item") or "Item")
+    desc_e = esc_md2(listing.get("description") or "")
+
+    blocks = []
+    for borrower_id, info in by_borrower.items():
+        uname = (info.get("username") or "").strip()
+        tag = esc_md2(f"@{uname}") if uname else esc_md2("No public username")
+        # collapse to nice ranges (1 per line)
+        ranges_str = format_date_ranges_from_tokens(sorted(info["dates"]))
+        ranges_e = esc_md2(ranges_str)
+
+        block = (
+            f"🏷️ *{item_e}*\n"
+            f"📄 {desc_e}\n"
+            f"👤 By: {tag}\n"
+            f"🗓 Rented out:\n{ranges_e}"
         )
+        blocks.append(block)
+
+    text = "📆 *Lending schedule*\n\n" + "\n\n".join(blocks)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"schedule_back_{listing_id}")]])
+    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+
+async def schedule_back_to_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    # schedule_back_<listing_id>
+    listing_id = q.data.split("_", 2)[2]
+
+    # Move index to this listing if it's present in memory
+    listings = context.user_data.get("my_listings", [])
+    for i, l in enumerate(listings):
+        if l.get("id") == listing_id:
+            context.user_data["listing_index"] = i
+            break
+
+    await send_single_listing(update, context)
 
 async def view_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -653,7 +1466,6 @@ async def start_editing_listing(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("📝 Item title", callback_data="edit_field_item")],
         [InlineKeyboardButton("🏷 Brand/Model", callback_data="edit_field_brand_model")],
         [InlineKeyboardButton("⚙️ Specs", callback_data="edit_field_specs")],
-        [InlineKeyboardButton("🔖 Tags", callback_data="edit_field_tags")],
         [InlineKeyboardButton("✏️ Description", callback_data="edit_field_description")],
         [InlineKeyboardButton("🛠 Condition", callback_data="edit_field_condition")],
         [InlineKeyboardButton("💰 Price", callback_data="edit_field_price")],
@@ -683,6 +1495,9 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
+    if query.data == "cancel_edit":
+        return await cancel_editing(update, context)
+
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
         await query.edit_message_text("Listing ID missing. Please try again.")
@@ -694,7 +1509,7 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         next_state = AWAIT_NEW_DESCRIPTION
     elif query.data == "edit_field_price":
         context.user_data["edit_field"] = "price"
-        prompt = "Please type in chat to what we will change the *price*:"
+        prompt = "Please type the new *price per day* with currency (e.g., `100 PLN`):"
         next_state = AWAIT_NEW_PRICE
     elif query.data == "edit_field_location":
         context.user_data["edit_field"] = "location"
@@ -728,15 +1543,14 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         context.user_data["edit_field"] = "specs"
         prompt = "Send 1–6 *specs* comma-separated (e.g., 24 frets, tremolo, HSH):"
         next_state = AWAIT_NEW_SPECS
-    elif query.data == "edit_field_tags":
-        context.user_data["edit_field"] = "tags"
-        prompt = "Send 2–8 *tags* comma-separated (e.g., music, rehearsal, rock):"
-        next_state = AWAIT_NEW_TAGS
 
     else:
-        await query.edit_message_text("Unknown edit field.")
-        return ConversationHandler.END
-    
+        await query.edit_message_text(
+            "Unknown option.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="edit_menu_back")]])
+        )
+        return EDIT_CHOICE
+
     cancel_button = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_edit")]])
 
     # send a completely new message
@@ -745,6 +1559,10 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
 
 async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_item = update.message.text.strip()
+    ok, why = await moderate_text(new_item)
+    if not ok:
+        await update.message.reply_text(f"🚫 Item title rejected: {why}. Please rephrase.")
+        return AWAIT_NEW_ITEM_TITLE
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
         await update.message.reply_text("Something went wrong.")
@@ -769,6 +1587,11 @@ async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_T
 async def receive_new_brand_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     new_brand_model = "" if text.lower() == "skip" else text
+    if new_brand_model:
+        ok, why = await moderate_text(new_brand_model)
+        if not ok:
+            await update.message.reply_text(f"🚫 Brand/Model rejected: {why}. Please rephrase or type 'Skip'.")
+            return AWAIT_NEW_BRAND_MODEL
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
         await update.message.reply_text("Something went wrong.")
@@ -792,6 +1615,10 @@ async def receive_new_brand_model(update: Update, context: ContextTypes.DEFAULT_
 
 async def receive_new_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
+    ok, why = await moderate_text(raw)
+    if not ok:
+        await update.message.reply_text(f"🚫 Specs rejected: {why}. Please rephrase.")
+        return AWAIT_NEW_SPECS
     new_specs = [s.strip() for s in raw.split(",") if s.strip()]
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
@@ -812,30 +1639,6 @@ async def receive_new_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }).eq("id", listing_id).execute()
 
     await update.message.reply_text("✅ Specs updated and embedding refreshed.")
-    return ConversationHandler.END
-
-async def receive_new_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip()
-    new_tags = [t.strip() for t in raw.split(",") if t.strip()]
-    listing_id = context.user_data.get("edit_listing_id")
-    if not listing_id:
-        await update.message.reply_text("Something went wrong.")
-        return ConversationHandler.END
-
-    listing = supabase.table("listings").select(
-        "item,brand_model,specs,tags,location,description,category"
-    ).eq("id", listing_id).execute().data[0]
-
-    embedding_input = build_embedding_input_from_row(listing, overrides={"tags": new_tags})
-    embedding = generate_embedding(embedding_input)
-    logging.info(f"[Embeddings] Tags edit → input='{embedding_input[:120]}...'")
-
-    supabase.table("listings").update({
-        "tags": new_tags,
-        "embedding": embedding
-    }).eq("id", listing_id).execute()
-
-    await update.message.reply_text("✅ Tags updated and embedding refreshed.")
     return ConversationHandler.END
 
 async def receive_new_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,6 +1677,10 @@ async def receive_new_category(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receive_new_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_desc = update.message.text
+    ok, why = await moderate_text(new_desc)
+    if not ok:
+        await update.message.reply_text(f"🚫 Description rejected: {why}. Please rephrase.")
+        return AWAIT_NEW_DESCRIPTION
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
         await update.message.reply_text("Something went wrong.")
@@ -903,6 +1710,10 @@ async def receive_new_description(update: Update, context: ContextTypes.DEFAULT_
 
 async def receive_new_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_condition = update.message.text
+    ok, why = await moderate_text(new_condition)
+    if not ok:
+        await update.message.reply_text(f"🚫 Condition text rejected: {why}. Please rephrase.")
+        return AWAIT_NEW_CONDITION
     listing_id = context.user_data.get("edit_listing_id")
 
     if not listing_id:
@@ -910,23 +1721,29 @@ async def receive_new_condition(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     supabase.table("listings").update({"condition": new_condition}).eq("id", listing_id).execute()
-    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
+    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"]]
     await update.message.reply_text("✅ Condition updated.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
     return ConversationHandler.END
 
 async def receive_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listing_id = context.user_data.get("edit_listing_id")
-    try:
-        new_price = float(update.message.text)
-    except ValueError:
-        await update.message.reply_text("❗ Please enter a valid number.")
+    raw = (update.message.text or "").strip()
+    m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
+    if not m:
+        await update.message.reply_text("Please enter price per day with currency, e.g. `100 PLN` or `99.90 EUR`", parse_mode="Markdown")
         return AWAIT_NEW_PRICE
 
-    supabase.table("listings").update({"price_per_day": new_price}).eq("id", listing_id).execute()
-    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
-    await update.message.reply_text("✅ Price updated.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    amount = float(m.group(1).replace(",", "."))
+    currency = (m.group(2) or "PLN").upper()
 
+    supabase.table("listings").update({
+        "price_per_day": amount,
+        "currency": currency
+    }).eq("id", listing_id).execute()
+
+    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"]]
+    await update.message.reply_text("✅ Price updated.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return ConversationHandler.END
 
 async def receive_new_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -962,7 +1779,7 @@ async def update_listing_description(update: Update, context: ContextTypes.DEFAU
     listing_id = context.user_data.get("edit_listing_id")
     new_text = update.message.text
     supabase.table("listings").update({"description": new_text}).eq("id", listing_id).execute()
-    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"], ["Settings"]]
+    keyboard = [["My Account", "Create a Listing"], ["Browse", "My Listings"]]
     await update.message.reply_text("✅ Description updated.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
 
     return ConversationHandler.END
@@ -970,7 +1787,8 @@ async def update_listing_description(update: Update, context: ContextTypes.DEFAU
 async def cancel_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    return await start_editing_listing(update, context)
+    await query.message.reply_text("Cancelled.")
+    return ConversationHandler.END
 
 async def confirm_delete_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1050,24 +1868,28 @@ async def start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_CATEGORY
 
 async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "Back": return await go_back(update, context)
+    if update.message.text == "Back": 
+        return await go_back(update, context)
     context.user_data['category'] = update.message.text
-    await update.message.reply_text("What's the name of the item? (e.g. 'Electric guitar', 'VR headset')", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "Please provide the item name plus brand and model (if it exists).\n"
+        "Examples:\n"
+        "• Electric guitar Ibanez RG370\n"
+        "• VR headset Meta Quest 3\n"
+        "• DJI drone Mini 3",
+        reply_markup=ReplyKeyboardRemove()
+    )
     return GET_ITEM_TITLE
 
 async def get_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Back":
         return await go_back(update, context)
-    context.user_data['item_title'] = update.message.text
-    await update.message.reply_text("Enter brand and/or model (or type 'Skip'):")
-    return GET_BRAND_MODEL
-
-async def get_brand_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "Back":
-        return await go_back(update, context)
-    brand_model = update.message.text.strip()
-    if brand_model.lower() != "skip":
-        context.user_data['brand_model'] = brand_model
+    text = update.message.text.strip()
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(f"🚫 Item title rejected: {why}. Please rephrase.")
+        return GET_ITEM_TITLE
+    context.user_data['item_title'] = text
     await update.message.reply_text("List 1–4 key specs (comma-separated):")
     return GET_SPECS
 
@@ -1075,20 +1897,22 @@ async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Back":
         return await go_back(update, context)
     specs = [s.strip() for s in update.message.text.split(",") if s.strip()]
+    # Check as a joined string
+    ok, why = await moderate_text(", ".join(specs))
+    if not ok:
+        await update.message.reply_text(f"🚫 Specs rejected: {why}. Please rephrase.")
+        return GET_SPECS
     context.user_data['specs'] = specs
-    await update.message.reply_text("Add 2–5 tags (comma-separated, like 'music, VR, guitar'):")
-    return GET_TAGS
-
-async def get_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "Back":
-        return await go_back(update, context)
-    tags = [t.strip() for t in update.message.text.split(",") if t.strip()]
-    context.user_data['tags'] = tags
-    await update.message.reply_text("✅ Got it! Now enter a short description:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Got it! Now enter a short description:", reply_markup=ReplyKeyboardRemove())
     return GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['description'] = update.message.text  # ← You were missing this line
+    text = update.message.text
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(f"🚫 Description rejected: {why}. Please rephrase.")
+        return GET_DESCRIPTION
+    context.user_data['description'] = text
     await update.message.reply_text(
         "Please describe any visible damage or wear. If it's in perfect condition, just say so.",
         reply_markup=ReplyKeyboardRemove()
@@ -1096,12 +1920,29 @@ async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_CONDITION
 
 async def get_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['condition'] = update.message.text
-    await update.message.reply_text("Enter the price per day (in PLN):", reply_markup=ReplyKeyboardRemove())
+    text = update.message.text
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(f"🚫 Condition text rejected: {why}. Please rephrase.")
+        return GET_CONDITION
+    context.user_data['condition'] = text
+    await update.message.reply_text("Please input the price per day and a currency. For example: 100 PLN", reply_markup=ReplyKeyboardRemove())
     return GET_PRICE
 
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['price_per_day'] = float(update.message.text)
+    raw = (update.message.text or "").strip()
+    # Accept: "100", "100 PLN", "120.50 eur", "120,50 uah"
+    m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
+    if not m:
+        await update.message.reply_text("Please enter price per day, e.g. `100 PLN` or `99.90 EUR`", parse_mode="Markdown")
+        return GET_PRICE
+
+    amount = float(m.group(1).replace(",", "."))
+    currency = (m.group(2) or "PLN").upper()
+
+    context.user_data['price_per_day'] = amount
+    context.user_data['currency'] = currency
+
     await update.message.reply_text("Send up to 3 photos of your item:")
     context.user_data['photos'] = []
     return GET_PHOTOS
@@ -1134,6 +1975,11 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif update.message.photo:
         file_id = update.message.photo[-1].file_id
+        ok, why = await moderate_telegram_photo(file_id, context.bot)
+        if not ok:
+            await update.message.reply_text(f"🚫 Photo rejected: {why}. Please send a different one.")
+            # do NOT append rejected photo
+            return GET_PHOTOS
         context.user_data['photos'].append(file_id)
     else:
         await update.message.reply_text("❗ Please send a photo or use text commands like 'Delete X', 'Add More', 'Continue', or 'Cancel Listing'.")
@@ -1209,29 +2055,42 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"[Embeddings] Create flow → input='{embedding_input[:160]}...'")
     embedding = generate_embedding(embedding_input)
 
+    user_id = str(update.effective_user.id)
+
+    # Check if this is the user's first listing (before we insert the new one)
+    pre_existing = supabase.table("listings").select("id").eq("owner_id", user_id).limit(1).execute()
+    is_first_listing = not pre_existing.data
+
     # Insert
     supabase.table("listings").insert({
         "owner_id": user_id,
         "category": context.user_data['category'],
         "description": context.user_data['description'],
         "item": context.user_data.get("item_title"),
-        "brand_model": context.user_data.get("brand_model"),
         "specs": context.user_data.get("specs"),
-        "tags": context.user_data.get("tags"),
         "condition": context.user_data['condition'],
         "price_per_day": context.user_data['price_per_day'],
+        "currency": context.user_data.get("currency", "PLN"),
         "photos": context.user_data['photos'],
         "location": context.user_data['location'],
         "availability": availability,
-        "embedding": embedding
+        "embedding": embedding  # leave embeddings alone; no changes needed
     }).execute()
 
+
     keyboard = [["Yes", "No"]]
-    await update.message.reply_text(
-        "Would you feel safer with insurance for unexpected damage or theft?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-    return ConversationHandler.END
+    if is_first_listing:
+        # ask only once (first listing)
+        context.user_data["awaiting_insurance_feedback"] = True
+        keyboard = [["Yes", "No"]]
+        await update.message.reply_text(
+            "Would you feel safer with insurance for unexpected damage or theft?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("✅ Listing created.")
+        return await go_back(update, context)
 
 async def handle_insurance_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text.lower() == "yes":
@@ -1252,129 +2111,128 @@ async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await rent_back_to_listing(update, context)
 
 async def rent_choose_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry: from 'rent_year_<listing_id>'"""
     q = update.callback_query
     await q.answer()
     _, _, listing_id = q.data.partition("rent_year_")
 
-    # Persist listing_id during this rent flow
     context.user_data["rent_listing_id"] = listing_id
 
-    kb = [
-        [InlineKeyboardButton("2025", callback_data=f"rent_month_{listing_id}_2025"),
-        InlineKeyboardButton("2026", callback_data=f"rent_month_{listing_id}_2026")],
-        [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]
-    ]
-    await q.message.edit_text("Choose a year:", reply_markup=InlineKeyboardMarkup(kb))
+    # Compute available years dynamically (and stay within 2025/2026 to match existing patterns)
+    listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
+    grouped = _group_available_by_year_month(listing)
+    years = sorted(y for y in grouped.keys() if y in (2025, 2026))
+
+    if not years:
+        kb = [[InlineKeyboardButton("⬅️ Back to listing", callback_data="rent_back_to_listing")]]
+        await q.message.edit_text("No available days to book.", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    rows, row = [], []
+    for y in years:
+        row.append(InlineKeyboardButton(str(y), callback_data=f"rent_month_{listing_id}_{y}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+
+    rows.append([InlineKeyboardButton("⬅️ Back to listing", callback_data="rent_back_to_listing"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")])
+
+    await q.message.edit_text("Choose a year:", reply_markup=InlineKeyboardMarkup(rows))
 
 async def rent_choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """From 'rent_month_<listing_id>_<year>'"""
     q = update.callback_query
     await q.answer()
     parts = q.data.split("_")  # ["rent","month", listing_id, year]
     listing_id, year = parts[2], int(parts[3])
+
     context.user_data["rent_listing_id"] = listing_id
     context.user_data["rent_year"] = year
 
-    rows = []
-    row = []
-    for m in range(1, 13):
-        row.append(InlineKeyboardButton(_month_name(m), callback_data=f"rent_range_{listing_id}_{year}_{m}"))
+    listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
+    grouped = _group_available_by_year_month(listing)
+    months = sorted((grouped.get(year) or {}).keys())
+
+    if not months:
+        kb = [[InlineKeyboardButton("⬅️ Back to years", callback_data="rent_year_back")],
+              [InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")]]
+        await q.message.edit_text(f"Year: {year}\nNo available months.", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    rows, row = [], []
+    for m in months:
+        row.append(InlineKeyboardButton(_month_name(m), callback_data=f"rent_days_{listing_id}_{year}_{m}"))
         if len(row) == 3:
             rows.append(row); row = []
     if row: rows.append(row)
+
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="rent_year_back"),
-                InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")])
+                 InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")])
+
     await q.message.edit_text(f"Year: {year}\nChoose a month:", reply_markup=InlineKeyboardMarkup(rows))
 
-async def rent_choose_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rent_show_days_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # From 'rent_days_<listing_id>_<year>_<month>'
     q = update.callback_query
     await q.answer()
     _, _, listing_id, year, month = q.data.split("_")
     year, month = int(year), int(month)
+
     context.user_data.update({"rent_listing_id": listing_id, "rent_year": year, "rent_month": month})
 
-    ranges = _split_week_ranges(year, month)
-    kb = []
-    kb.append([
-        InlineKeyboardButton(f"{ranges[0][0]}-{ranges[0][1]}", callback_data=f"rent_day_{listing_id}_{year}_{month}_{ranges[0][0]}_{ranges[0][1]}"),
-        InlineKeyboardButton(f"{ranges[1][0]}-{ranges[1][1]}", callback_data=f"rent_day_{listing_id}_{year}_{month}_{ranges[1][0]}_{ranges[1][1]}")
-    ])
-    kb.append([
-        InlineKeyboardButton(f"{ranges[2][0]}-{ranges[2][1]}", callback_data=f"rent_day_{listing_id}_{year}_{month}_{ranges[2][0]}_{ranges[2][1]}"),
-        InlineKeyboardButton(f"{ranges[3][0]}-{ranges[3][1]}", callback_data=f"rent_day_{listing_id}_{year}_{month}_{ranges[3][0]}_{ranges[3][1]}")
-    ])
-    kb.append([
-        InlineKeyboardButton("⬅️ Back", callback_data=f"rent_month_back_{listing_id}_{year}"),
-        InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")
-    ])
-    await q.message.edit_text(f"{_month_name(month)} {year}\nChoose a range:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def rent_show_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """From 'rent_day_<listing_id>_<year>_<month>_<a>_<b>' -> show only available days as buttons"""
-    q = update.callback_query
-    await q.answer()
-    _, _, listing_id, year, month, a, b = q.data.split("_")
-    year, month, a, b = int(year), int(month), int(a), int(b)
-
-    # Fetch fresh listing for availability & bookings
     listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
-    available = _collect_available_days(listing)
+    grouped = _group_available_by_year_month(listing)
+    day_pairs = (grouped.get(year, {}).get(month, []))  # [(day_int, token), ...]
 
-    # Build day buttons only for those in 'available' for that month & range
-    day_buttons = []
-    row = []
-    for day in range(a, b+1):
-        # Guard against non-existent days (e.g., 31 in a 30-day month)
-        if day > monthrange(year, month)[1]:
-            continue
-        d = datetime(year, month, day).date()
-        token = _fmt_like_source(d, listing.get("availability") or [])
-        if token in available:
-            row.append(InlineKeyboardButton(str(day), callback_data=f"rent_pick_{listing_id}_{token}"))
-            if len(row) == 7:
-                day_buttons.append(row); row = []
-    if row: day_buttons.append(row)
+    # Build day buttons only for available days
+    buttons, row = [], []
+    for day, token in day_pairs:
+        row.append(InlineKeyboardButton(str(day), callback_data=f"rent_pick_{listing_id}_{token}"))
+        if len(row) == 7:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
 
-    # Fallback if nothing free in that range
-    if not day_buttons:
-        day_buttons = [[InlineKeyboardButton("No free days here", callback_data="noop")]]
+    if not buttons:
+        buttons = [[InlineKeyboardButton("No free days here", callback_data="noop")]]
 
-    day_buttons.append([
-        InlineKeyboardButton("⬅️ Back", callback_data=f"rent_range_back_{listing_id}_{year}_{month}"),
-        InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")
+    buttons.append([
+        InlineKeyboardButton("⬅️ Back", callback_data=f"rent_month_back_{listing_id}_{year}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")
     ])
-    await q.message.edit_text(
-        f"{_month_name(month)} {year}\nPick a day:",
-        reply_markup=InlineKeyboardMarkup(day_buttons)
-    )
+
+    await q.message.edit_text(f"{_month_name(month)} {year}\nPick a day:",
+                              reply_markup=InlineKeyboardMarkup(buttons))
 
 async def rent_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    # rent_pick_<listing_id>_<dateStrInSourceFormat>
     _, _, listing_id, day_token = q.data.split("_", 3)
 
-    # Load listing and check that day is still free
     listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
     available = _collect_available_days(listing)
 
     if day_token not in available:
+        # Figure out a sensible year to go back to
+        d = _parse_date_any(day_token)
+        year = d.year if d else context.user_data.get('rent_year', 2025)
         await q.message.edit_text("😕 Sorry, this day was just taken. Please pick another one.",
                                   reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton("Back to months", callback_data=f"rent_month_{listing_id}_2025"),
-                                        InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
+                                      [[InlineKeyboardButton("Back to months", callback_data=f"rent_month_{listing_id}_{year}")],
+                                       [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
                                   ))
         return
 
     sel = _add_selected_day(context, listing_id, day_token)
 
-    # Build a short summary of selected days
     preview = ", ".join(sel[:6]) + (" …" if len(sel) > 6 else "")
-    txt = f"✅ Added **{day_token}**.\n\nSelected so far: {preview or '—'}\n\nSelect more days?"
+    txt = f"✅ Added *{day_token}*.\n\nSelected so far: {preview or '—'}\n\nSelect more days?"
+
+    year = context.user_data.get('rent_year')
+    if not year:
+        d = _parse_date_any(day_token)
+        year = d.year if d else 2025
 
     kb = [
-        [InlineKeyboardButton("➕ Select more days", callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year', '2025')}")],
+        [InlineKeyboardButton("➕ Select more days", callback_data=f"rent_month_{listing_id}_{year}")],
         [InlineKeyboardButton("✅ Finish selecting", callback_data=f"rent_finish_{listing_id}")],
         [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]
     ]
@@ -1392,40 +2250,43 @@ async def rent_year_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listing_id = context.user_data.get("rent_listing_id")
     if not listing_id:
         return await rent_back_to_listing(update, context)
-    kb = [
-        [InlineKeyboardButton("2025", callback_data=f"rent_month_{listing_id}_2025"),
-         InlineKeyboardButton("2026", callback_data=f"rent_month_{listing_id}_2026")],
-        [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]
-    ]
-    await q.message.edit_text("Choose a year:", reply_markup=InlineKeyboardMarkup(kb))
+
+    listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
+    grouped = _group_available_by_year_month(listing)
+    years = sorted(y for y in grouped.keys() if y in (2025, 2026))
+
+    rows, row = [], []
+    for y in years:
+        row.append(InlineKeyboardButton(str(y), callback_data=f"rent_month_{listing_id}_{y}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back to listing", callback_data="rent_back_to_listing"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")])
+
+    await q.message.edit_text("Choose a year:", reply_markup=InlineKeyboardMarkup(rows))
 
 async def rent_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    # rent_month_back_<listing_id>_<year>
     _, _, listing_id, year = q.data.split("_")
-    kb = [
-        [InlineKeyboardButton("2025", callback_data=f"rent_month_{listing_id}_2025"),
-         InlineKeyboardButton("2026", callback_data=f"rent_month_{listing_id}_2026")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="rent_back_to_listing")]
-    ]
-    await q.message.edit_text("Choose a year:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def rent_range_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, _, listing_id, year, month = q.data.split("_")
     year = int(year)
-    # Reuse the month grid rendering (inline here for safety)
+
+    listing = supabase.table("listings").select("*").eq("id", listing_id).execute().data[0]
+    grouped = _group_available_by_year_month(listing)
+    months = sorted((grouped.get(year) or {}).keys())
+
     rows, row = [], []
-    for m in range(1, 13):
-        row.append(InlineKeyboardButton(_month_name(m), callback_data=f"rent_range_{listing_id}_{year}_{m}"))
+    for m in months:
+        row.append(InlineKeyboardButton(_month_name(m), callback_data=f"rent_days_{listing_id}_{year}_{m}"))
         if len(row) == 3:
             rows.append(row); row = []
     if row: rows.append(row)
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="rent_year_back"),
-                 InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")])
+                 InlineKeyboardButton("❌ Cancel", callback_data="rent_cancel")])
+
     await q.message.edit_text(f"Year: {year}\nChoose a month:", reply_markup=InlineKeyboardMarkup(rows))
+
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
@@ -1450,7 +2311,7 @@ async def rent_finish_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return (d or datetime.max.date(), s)
     sel_sorted = sorted(sel, key=_key)
 
-    txt = "🗓 **Review selection**\n\n" + "\n".join(f"• {d}" for d in sel_sorted) + "\n\nAre you sure?"
+    txt = "🗓 *Review selection*\n\n" + "\n".join(f"• {d}" for d in sel_sorted) + "\n\nAre you sure?"
     kb = [
         [InlineKeyboardButton("✅ Yes, book them", callback_data=f"rent_confirm_yes_{listing_id}")],
         [InlineKeyboardButton("🙅 No, keep selecting", callback_data=f"rent_confirm_no_{listing_id}")],
@@ -1466,42 +2327,74 @@ async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sel = _get_selected_days(context, listing_id)
     if not sel:
-        await q.message.edit_text("There are no selected days to book.", reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Back", callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
-             [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
-        ))
+        await q.message.edit_text(
+            "There are no selected days to request",
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Back", callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
+                 [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
+            )
+        )
         return
 
-    # Re‑fetch listing to avoid race conditions
-    listing = supabase.table("listings").select("availability, booked_days").eq("id", listing_id).execute().data[0]
-    available = _collect_available_days(listing)
-    booked_now = set(listing.get("booked_days") or [])
+    # Normalize to ISO for storage
+    iso_days = _to_iso_list(sel)
 
-    # Only keep still‑free days
-    commit = [d for d in sel if d in available and d not in booked_now]
-    skipped = [d for d in sel if d not in commit]
+    # Fetch listing and compute totals
+    listing = supabase.table("listings").select(
+        "owner_id,item,category,price_per_day,currency"
+    ).eq("id", listing_id).execute().data[0]
 
-    if not commit:
-        await q.message.edit_text("😕 None of your selected days are still free. Please pick other dates.",
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton("Back to months", callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
-                                       [InlineKeyboardButton("❌ Cancel Reservation", callback_data="rent_cancel")]]
-                                  ))
-        _clear_selected_days(context, listing_id)
-        return
+    lender_id = listing["owner_id"]
+    borrower_id = str(update.effective_user.id)
+    borrower_username = update.effective_user.username or ""
+    price_per_day = float(listing.get("price_per_day") or 0)
+    currency = (listing.get("currency") or "PLN").upper()
+    day_count = len(iso_days)
+    total_price = round(price_per_day * day_count, 2)
+    borrower_browse_input = (context.user_data.get("last_search_query") or "").strip() or None
 
-    # Save
-    new_booked = list(booked_now.union(commit))
-    supabase.table("listings").update({"booked_days": new_booked}).eq("id", listing_id).execute()
+    # Insert the rental request (pending)
+    supabase.table("rental_requests").insert({
+        "listing_id": listing_id,
+        "lender_id": lender_id,
+        "borrower_id": borrower_id,
+        "borrower_username": borrower_username,
+        "dates": iso_days,
+        "status": "pending",
+        "total_price": total_price,
+        "currency": currency,
+        "message_from_borrower": context.user_data.get("last_search_query", ""),
+    }).execute()
 
+    # Clear selection now that it’s submitted
     _clear_selected_days(context, listing_id)
 
-    msg = "✅ Booked:\n" + "\n".join(f"• {d}" for d in commit)
-    if skipped:
-        msg += "\n\n(These were already unavailable and were skipped):\n" + "\n".join(f"• {d}" for d in skipped)
+    # Nice ranges for the message
+    nice_dates, _ = _ranges_from_iso(iso_days)
 
-    kb = [[InlineKeyboardButton("⬅️ Back to listing", callback_data="rent_back_to_listing")]]
-    await q.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+    item_e  = esc_md2(listing.get("item") or "Item")
+    cat_e   = esc_md2(listing.get("category") or "")
+    dates_e = esc_md2(nice_dates)
+    cur_e   = esc_md2(currency)
+    total_e = esc_md2(f"{total_price:.2f}")
+    footer  = esc_md2("You'll get a message here once the owner accepts or declines")
+
+    txt = (
+        "📩 *Request sent to the owner*\n\n"
+        f"• Item: *{item_e}* — {cat_e}\n"
+        f"• Dates: {dates_e} — {day_count} day{'s' if day_count != 1 else ''}\n"
+        f"• Estimated total: *{total_e} {cur_e}*\n\n"
+        f"{footer}"
+    )
+
+    await q.message.edit_text(
+        txt,
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back to listing", callback_data="rent_back_to_listing")]]
+        ),
+    )
 
 async def rent_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1522,9 +2415,7 @@ listing_conv = ConversationHandler(
     states={
         GET_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_category)],
         GET_ITEM_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_title)],
-        GET_BRAND_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_brand_model)],
         GET_SPECS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_specs)],
-        GET_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tags)],
         GET_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_description)],
         GET_CONDITION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_condition)],
         GET_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_price)],
@@ -1547,7 +2438,6 @@ edit_conv = ConversationHandler(
         AWAIT_NEW_ITEM_TITLE: [MessageHandler(filters.TEXT, receive_new_item_title)],
         AWAIT_NEW_BRAND_MODEL: [MessageHandler(filters.TEXT, receive_new_brand_model)],
         AWAIT_NEW_SPECS: [MessageHandler(filters.TEXT, receive_new_specs)],
-        AWAIT_NEW_TAGS: [MessageHandler(filters.TEXT, receive_new_tags)],
         CONFIRM_DELETE: [CallbackQueryHandler(handle_delete_confirmation)]
     },
     fallbacks=[CallbackQueryHandler(cancel_editing, pattern="^cancel_edit$")]
@@ -1593,7 +2483,21 @@ if __name__ == '__main__':
     # === register ALL handlers here (your existing ones) ===
     app.add_handler(CommandHandler("start", start))
 
-    # Conversations/handlers you already set up:
+    # My Account
+    app.add_handler(MessageHandler(filters.Regex("^My Account$"), handle_my_account))
+
+    # Requests UI
+    app.add_handler(CallbackQueryHandler(account_requests, pattern=r"^account_requests$"))
+    app.add_handler(CallbackQueryHandler(account_req_next, pattern=r"^account_req_next$"))
+    app.add_handler(CallbackQueryHandler(account_req_prev, pattern=r"^account_req_prev$"))
+
+    # Accept / Decline
+    app.add_handler(CallbackQueryHandler(handle_request_accept, pattern=r"^req_accept_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(handle_request_decline, pattern=r"^req_decline_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(show_lending_schedule,   pattern=r"^schedule_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(schedule_back_to_listing, pattern=r"^schedule_back_[0-9a-fA-F-]{36}$"))
+
+    # Conversations/handlers 
     app.add_handler(listing_conv)
     app.add_handler(MessageHandler(filters.Regex("^Back$"), go_back))
     app.add_handler(MessageHandler(filters.Regex("^My Listings$"), view_my_listings))
@@ -1605,27 +2509,26 @@ if __name__ == '__main__':
     app.add_handler(browse_conv)
     app.add_handler(CallbackQueryHandler(browse_next_match, pattern="^browse_next$"))
     app.add_handler(CallbackQueryHandler(browse_prev_match, pattern="^browse_prev$"))
+    app.add_handler(CallbackQueryHandler(account_my_borrowings, pattern=r"^my_borrowings$"))
+    app.add_handler(CallbackQueryHandler(account_overview, pattern=r"^account_overview$"))
+    app.add_handler(CallbackQueryHandler(edit_menu_back, pattern=r"^edit_menu_back$"))
 
     # Rental flow
     app.add_handler(CallbackQueryHandler(rent_choose_year,   pattern=r"^rent_year_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_choose_month,  pattern=r"^rent_month_[0-9a-fA-F-]{36}_(2025|2026)$"))
-    app.add_handler(CallbackQueryHandler(rent_choose_range,  pattern=r"^rent_range_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
-    app.add_handler(CallbackQueryHandler(rent_show_days,     pattern=r"^rent_day_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])_([0-2]?[0-9]|3[01])_([0-2]?[0-9]|3[01])$"))
     app.add_handler(CallbackQueryHandler(rent_pick_day,      pattern=r"^rent_pick_[0-9a-fA-F-]{36}_.+$"))
     app.add_handler(CallbackQueryHandler(rent_back_to_listing, pattern=r"^rent_back_to_listing$"))
     app.add_handler(CallbackQueryHandler(rent_year_back,       pattern=r"^rent_year_back$"))
     app.add_handler(CallbackQueryHandler(rent_month_back,      pattern=r"^rent_month_back_[0-9a-fA-F-]{36}_(2025|2026)$"))
-    app.add_handler(CallbackQueryHandler(rent_range_back,      pattern=r"^rent_range_back_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
     app.add_handler(CallbackQueryHandler(noop,                 pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(rent_finish_prompt,   pattern=r"^rent_finish_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_confirm_yes,     pattern=r"^rent_confirm_yes_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_confirm_no,      pattern=r"^rent_confirm_no_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(rent_show_days_month, pattern=r"^rent_days_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
+    app.add_handler(CallbackQueryHandler(rent_cancel, pattern=r"^rent_cancel$"))
 
     # Insurance feedback (add once)
     app.add_handler(MessageHandler(filters.Regex("^(Yes|No)$"), handle_insurance_feedback))
-
-    # Settings conv
-    app.add_handler(settings_conv)
 
     # === run ===
     import asyncio
