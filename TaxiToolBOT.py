@@ -18,6 +18,7 @@ import asyncio
 from functools import lru_cache
 from typing import Dict
 
+#Check
 # === Configuration ===
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")  # used locally; Cloud Run ignores .env
 
