@@ -1,6 +1,7 @@
 import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup,LabeledPrice
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler, CallbackQueryHandler, PreCheckoutQueryHandler
+from telegram.error import TimedOut, RetryAfter, NetworkError
 from supabase import create_client, Client
 from datetime import datetime, timedelta, date, timezone
 from openai import AsyncOpenAI
@@ -325,6 +326,20 @@ async def async_reverse(latlon):
 
 _MD2_SPECIAL = r'[_*[\]()~`>#+\-=|{}.!]'
 
+async def safe_send(func, *args, **kwargs):
+    """Call a PTB send/edit method with one retry + simple backoff."""
+    try:
+        return await func(*args, **kwargs)
+    except RetryAfter as e:
+        # Telegram is throttling — wait the suggested time
+        await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
+        return await func(*args, **kwargs)
+    except (TimedOut, NetworkError):
+        # Transient network hiccup — short backoff and retry once
+        logging.warning("[send] transient timeout/network error; retrying once…")
+        await asyncio.sleep(0.8)
+        return await func(*args, **kwargs)
+        
 def _parse_ts_iso(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -769,58 +784,85 @@ async def moderate_telegram_photo(file_id: str, bot) -> tuple[bool, str]:
             pass
 
 # === Language selection handlers (callable from /start or a separate /language later) ===
+# /language
 async def prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    await update.message.reply_text(tr(me, "choose_language"), reply_markup=lang_keyboard())
+    await safe_send(
+        update.message.reply_text,
+        tr(me, "choose_language"),
+        reply_markup=lang_keyboard()
+    )
 
+# set_lang_<xx> callback
 async def set_language_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     me = str(update.effective_user.id)
-    data = q.data  # set_lang_en / set_lang_pl / set_lang_uk
+    data = q.data
     lang = data.split("_")[-1]
     if lang not in ("en", "pl", "uk"):
         lang = "en"
-    set_user_lang(me, lang)  # <- sync now
-    await q.message.reply_text(tr(me, "greeting"), reply_markup=main_menu_keyboard(me))
-
+    set_user_lang(me, lang)
+    await safe_send(
+        q.message.reply_text,
+        tr(me, "greeting"),
+        reply_markup=main_menu_keyboard(me)
+    )
 
 
 # === Start Command ===
+# Keep these helpers as they are:
+# - get_user_lang(uid)
+# - set_user_lang(uid, lang)
+# - lang_keyboard()
+# - tr(uid, key)
+# - main_menu_keyboard()  (or whatever you use to show the home menu)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    me = str(user.id)
+    me = str(update.effective_user.id)
 
-    try:
-        existing = supabase.table("users").select("id, language").eq("id", me).execute()
-        if not existing.data:
-            supabase.table("users").insert({
-                "id": me,
-                "telegram_username": user.username,
-                "display_name": user.first_name,
-                "language": "en",  # keep if you want a default
-            }).execute()
-            LANG_CACHE[me] = "en"
-            # ⬇️ force-show the picker on first run
-            await prompt_language(update, context)
-            return
-        else:
-            lang = (existing.data[0] or {}).get("language") or "en"
-            LANG_CACHE[me] = lang
-    except Exception as e:
-        logging.warning(f"[startup] users upsert error: {e}")
-        LANG_CACHE[me] = "en"
-
-    # fallback if user somehow has no valid language
+    # 1) NEVER force a language for existing users
+    #    This reads from cache/DB and seeds LANG_CACHE if needed.
     lang = get_user_lang(me)
-    if not lang or lang not in ("en", "pl", "uk"):
-        await prompt_language(update, context)
+
+    # 2) Ensure the user row exists, but don't override their language
+    try:
+        rows = supabase.table("users").select("id, language").eq("id", me).limit(1).execute().data
+    except Exception as e:
+        # If DB hiccups, still keep current lang and show menu
+        rows = []
+
+    if not rows:
+        # First time we've seen this user — try to guess from Telegram
+        guess = (update.effective_user.language_code or "").split("-")[0].lower()
+        if guess in ("en", "pl", "uk"):
+            set_user_lang(me, guess)
+            lang = guess
+        else:
+            # keep whatever get_user_lang() returned (likely DEFAULT_LANG)
+            set_user_lang(me, lang)
+
+        # Create the user row (don’t re-override language)
+        try:
+            supabase.table("users").insert({"id": me, "language": lang}).execute()
+        except Exception:
+            pass
+
+        # Show language picker only once (on first start)
+        await update.effective_message.reply_text(
+            tr(me, "choose_language"),
+            reply_markup=lang_keyboard()
+        )
         return
 
-    # Always show language buttons on the greeting
-    await update.message.reply_text(
-        tr(me, "greeting"),
-        reply_markup=main_menu_keyboard(me)
+    # 3) Existing user — keep their saved language exactly as-is
+    saved = rows[0].get("language") or lang
+    LANG_CACHE[me] = saved  # refresh cache; do NOT set to 'en'
+
+    # 4) Show your normal home/menu in the user’s current language
+    await update.effective_message.reply_text(
+        tr(me, "home_tip"),
+        reply_markup=main_menu_keyboard()
     )
 
 
