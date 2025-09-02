@@ -2,7 +2,7 @@ import logging
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup,LabeledPrice
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters, ConversationHandler, CallbackQueryHandler, PreCheckoutQueryHandler
 from supabase import create_client, Client
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from openai import AsyncOpenAI
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
@@ -16,6 +16,7 @@ import re
 import base64
 import asyncio
 from functools import lru_cache
+from typing import Dict
 
 # === Configuration ===
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")  # used locally; Cloud Run ignores .env
@@ -57,7 +58,6 @@ AWAIT_SEARCH_QUERY, SETTINGS_MENU, AWAIT_LOCATION_CHOICE = range(300, 303)
 LANG_SELECT = 350  # new: pick language flow (if you later want a conversation step)
 
 # === i18n (English / Українська / Polski) ===
-LANG_CACHE: dict[str, str] = {}  # user_id -> 'en'|'uk'|'pl'
 
 LOCALES = {
     "en": {
@@ -174,7 +174,7 @@ LOCALES = {
         "lang_en": "English",
         "lang_uk": "Українська",
         "lang_pl": "Polski",
-        "greeting": "Привіт! Я RentoTo — асистент зі спільного користування інструментами. Ти можеш орендувати речі або додати власне оголошення.",
+        "greeting": "Привіт! Я RentoTo — асистент зі позичання речей і інструментів. Ти можеш орендувати речі або додати власне оголошення.",
         "menu_main": "Головне меню:",
         "btn_my_account": "Мій акаунт",
         "btn_create_listing": "Створити оголошення",
@@ -224,31 +224,36 @@ LOCALES = {
 }
 
 # === i18n helpers (sync) ===
-def get_user_lang(user_id: str) -> str:
-    lang = LANG_CACHE.get(user_id)
-    if lang:
-        return lang
+
+# === i18n helpers (sync) ===
+
+DEFAULT_LANG = "en"
+LANG_CACHE: Dict[str, str] = {}
+
+def get_user_lang(uid: str) -> str:
+    if uid in LANG_CACHE:
+        return LANG_CACHE[uid]
     try:
-        row = supabase.table("users").select("language").eq("id", user_id).execute().data
-        if row and row[0].get("language") in ("en", "pl", "uk"):
-            lang = row[0]["language"]
-        else:
-            lang = "en"
+        res = supabase.table("users").select("language").eq("id", uid).single().execute()
+        lang = (res.data or {}).get("language") or DEFAULT_LANG
     except Exception:
-        lang = "en"
-    LANG_CACHE[user_id] = lang
+        lang = DEFAULT_LANG
+    LANG_CACHE[uid] = lang
     return lang
 
-def set_user_lang(user_id: str, lang: str) -> None:
+def set_user_lang(uid: str, lang: str) -> None:
+    LANG_CACHE[uid] = lang
     try:
-        supabase.table("users").update({"language": lang}).eq("id", user_id).execute()
+        supabase.table("users").upsert({"id": uid, "language": lang}).execute()
     except Exception as e:
-        logging.warning(f"[i18n] failed to save language: {e}")
-    LANG_CACHE[user_id] = lang
+        logging.warning(f"[lang] failed to persist language for {uid}: {e}")
 
-def tr(user_id: str, key: str, **fmt) -> str:
-    s = _t_for_lang(get_user_lang(user_id), key)
-    return s.format(**fmt) if fmt else s
+def tr(uid: str, key: str, **fmt) -> str:
+    # Lazy-load language from DB if cache is cold (e.g., after restart)
+    lang = LANG_CACHE.get(uid) or get_user_lang(uid)
+    bucket = LOCALES.get(lang) or LOCALES.get(DEFAULT_LANG, {})
+    txt = bucket.get(key, LOCALES.get(DEFAULT_LANG, {}).get(key, key))
+    return txt.format(**fmt)
 
 def get_entitlement(user_id: str) -> tuple[int | None, int, bool]:
     try:
@@ -769,9 +774,10 @@ async def set_language_from_callback(update: Update, context: ContextTypes.DEFAU
     lang = data.split("_")[-1]
     if lang not in ("en", "pl", "uk"):
         lang = "en"
-    set_user_lang(me, lang)
-    # greet in the chosen language and show localized main menu
+    set_user_lang(me, lang)  # <- sync now
     await q.message.reply_text(tr(me, "greeting"), reply_markup=main_menu_keyboard(me))
+
+
 
 # === Start Command ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -807,7 +813,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Always show language buttons on the greeting
     await update.message.reply_text(
         tr(me, "greeting"),
-        reply_markup=lang_keyboard()
+        reply_markup=main_menu_keyboard(me)
     )
 
 
@@ -1134,38 +1140,58 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
         return
     rr = rr_list[0]
 
+    # Pull listing and requested days
     listing = supabase.table("listings").select("*").eq("id", rr["listing_id"]).execute().data[0]
     requested = rr.get("dates", []) or []
 
-    # update request status
+    # Mark accepted + book the days
     supabase.table("rental_requests").update({"status": "accepted"}).eq("id", req_id).execute()
-
-    # mark booked days on listing
     booked = (listing.get("booked_days") or [])
     new_booked = sorted(set(booked) | set(_to_iso_list(requested)))
     supabase.table("listings").update({"booked_days": new_booked}).eq("id", listing["id"]).execute()
 
-    # prepare confirmation for the UI card
+    # Money & dates
     currency = (listing.get("currency") or "PLN").upper()
     price_per_day = float(listing.get("price_per_day") or 0)
     total = round(price_per_day * len(requested), 2)
     pretty_ranges = format_date_ranges_from_tokens(requested)
 
+    # Escape for MarkdownV2
     item_e   = esc_md2(listing.get('item') or 'Item')
     ranges_e = esc_md2(pretty_ranges)
     cur_e    = esc_md2(currency)
     tot_e    = esc_md2(f"{total:.2f}")
 
-    await q.message.edit_text(
+    # Borrower contact (tag if public @username; otherwise a tg:// link)
+    borrower_username = (rr.get("borrower_username") or "").strip()
+    borrower_tg_id = str(rr.get("borrower_id") or "")
+    if borrower_username:
+        borrower_contact_line = f"👤 {esc_md2('@' + borrower_username)}"
+        borrower_intro_line = ""
+    else:
+        borrower_contact_line = f"[👤](tg://user?id={borrower_tg_id})"
+        borrower_intro_line = esc_md2(tr(me, "no_public_username"))
+
+    # Build the confirmation shown to the lender (includes nudge)
+    text = (
         f"✅ {esc_md2(tr(me, 'accepted_and_booked'))}\n\n"
         f"🏷️ *{item_e}*\n"
         f"📅\n{ranges_e}\n"
-        f"💰 {esc_md2(tr(me, 'price_total'))}: {tot_e} {cur_e}",
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]])
+        f"💰 {esc_md2(tr(me, 'price_total'))}: {tot_e} {cur_e}\n\n"
+        f"{borrower_intro_line}\n"
+        f"{borrower_contact_line}\n\n"
+        f"{esc_md2(tr(me, 'nudge_text_v2'))}"
     )
 
-    # Notify borrower (safe MarkdownV2 – no tg:// link here)
+    await q.message.edit_text(
+        text,
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(tr(me, 'back_to_requests'), callback_data='account_requests')]]
+        ),
+    )
+
+    # Notify borrower
     try:
         borrower_id = int(rr["borrower_id"])
         await context.bot.send_message(
@@ -1181,26 +1207,19 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logging.warning(f"Failed to notify borrower: {e}")
 
-    # NEW: Tell the lender who the borrower is *now*, with a friendly nudge to chat
+    # Optional extra nudge to lender with the @tag text-only
     try:
         lender_chat_id = int(listing["owner_id"])
-        borrower_username = (rr.get("borrower_username") or "").strip()
-
         if borrower_username:
             at_tag_e = esc_md2(f"@{borrower_username}")
-            msg = (
-                f"{esc_md2(tr(me, 'nice_borrower_is', username=at_tag_e))}\n\n"
-                f"{tr(me, 'nudge_text_v2')}"
-            )
+            msg = f"{esc_md2(tr(me, 'nice_borrower_is', username=at_tag_e))}\n\n{esc_md2(tr(me, 'nudge_text_v2'))}"
             await context.bot.send_message(chat_id=lender_chat_id, text=msg, parse_mode="MarkdownV2")
         else:
-            # keep this one WITHOUT parse_mode so tg:// doesn't need escaping
-            fallback = (
-                f"{tr(me, 'no_public_username')}"
-                f"tg://user?id={rr['borrower_id']}"
+            # no parse_mode here — raw tg:// link is fine
+            await context.bot.send_message(
+                chat_id=lender_chat_id,
+                text=f"{tr(me, 'no_public_username')}tg://user?id={rr['borrower_id']}"
             )
-            await context.bot.send_message(chat_id=lender_chat_id, text=fallback)
-
     except Exception as e:
         logging.warning(f"Failed to notify lender with borrower tag: {e}")
 
@@ -3323,7 +3342,7 @@ async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['location'] = f"{lat},{lon}"
     else:
         city_name = update.message.text
-        location = await async_geocode(user_input)
+        location = await async_geocode(city_name)
         if location:
             context.user_data['location'] = f"{location.latitude},{location.longitude}"
         else:
@@ -3912,7 +3931,8 @@ if __name__ == '__main__':
     # === register ALL handlers here ===
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(set_language_from_callback, pattern=r"^set_lang_(en|pl|uk)$"))  
-    app.add_handler(CommandHandler("language", prompt_language))
+    application.add_handler(CommandHandler("language", prompt_language))
+
 
     # My Account (supports badge in () or [])
     app.add_handler(MessageHandler(filters.Regex(MY_ACCOUNT_RE), handle_my_account))
