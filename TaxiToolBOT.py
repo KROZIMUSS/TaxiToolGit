@@ -231,16 +231,22 @@ LOCALES = {
 DEFAULT_LANG = "en"
 LANG_CACHE: Dict[str, str] = {}
 
-def get_user_lang(uid: str) -> str:
-    if uid in LANG_CACHE:
-        return LANG_CACHE[uid]
+def get_user_lang(user_id: str) -> str:
+    lang = LANG_CACHE.get(user_id)
+    if lang:
+        return lang
     try:
-        res = supabase.table("users").select("language").eq("id", uid).single().execute()
-        lang = (res.data or {}).get("language") or DEFAULT_LANG
-    except Exception:
+        res = supabase.table("users").select("language").eq("id", user_id).execute()
+        if res.data:
+            lang = (res.data[0].get("language") or DEFAULT_LANG)
+        else:
+            lang = DEFAULT_LANG
+    except Exception as e:
+        logging.warning(f"get_user_lang fallback: {e}")
         lang = DEFAULT_LANG
-    LANG_CACHE[uid] = lang
+    LANG_CACHE[user_id] = lang
     return lang
+
 
 def set_user_lang(uid: str, lang: str) -> None:
     LANG_CACHE[uid] = lang
@@ -1136,44 +1142,45 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
     if not rr_list:
         await q.message.edit_text(
             tr(me, "request_not_found"),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]])
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+            )
         )
         return
     rr = rr_list[0]
 
-    # Pull listing and requested days
     listing = supabase.table("listings").select("*").eq("id", rr["listing_id"]).execute().data[0]
     requested = rr.get("dates", []) or []
 
-    # Mark accepted + book the days
+    # 1) Update status + mark booked days
     supabase.table("rental_requests").update({"status": "accepted"}).eq("id", req_id).execute()
     booked = (listing.get("booked_days") or [])
     new_booked = sorted(set(booked) | set(_to_iso_list(requested)))
     supabase.table("listings").update({"booked_days": new_booked}).eq("id", listing["id"]).execute()
 
-    # Money & dates
+    # 2) Compute UI numbers
     currency = (listing.get("currency") or "PLN").upper()
     price_per_day = float(listing.get("price_per_day") or 0)
     total = round(price_per_day * len(requested), 2)
     pretty_ranges = format_date_ranges_from_tokens(requested)
 
-    # Escape for MarkdownV2
     item_e   = esc_md2(listing.get('item') or 'Item')
     ranges_e = esc_md2(pretty_ranges)
     cur_e    = esc_md2(currency)
     tot_e    = esc_md2(f"{total:.2f}")
 
-    # Borrower contact (tag if public @username; otherwise a tg:// link)
+    # 3) Borrower contact line
     borrower_username = (rr.get("borrower_username") or "").strip()
-    borrower_tg_id = str(rr.get("borrower_id") or "")
+    borrower_tg_id = rr.get("borrower_id")
+
     if borrower_username:
         borrower_contact_line = f"👤 {esc_md2('@' + borrower_username)}"
-        borrower_intro_line = ""
+        borrower_intro_line = ""  # no intro needed
     else:
         borrower_contact_line = f"[👤](tg://user?id={borrower_tg_id})"
         borrower_intro_line = esc_md2(tr(me, "no_public_username"))
 
-    # Build the confirmation shown to the lender (includes nudge)
+    # 4) Final lender-facing message (with nudge)
     text = (
         f"✅ {esc_md2(tr(me, 'accepted_and_booked'))}\n\n"
         f"🏷️ *{item_e}*\n"
@@ -1192,7 +1199,7 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
         ),
     )
 
-    # Notify borrower
+    # 5) Notify borrower
     try:
         borrower_id = int(rr["borrower_id"])
         await context.bot.send_message(
@@ -1207,22 +1214,6 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except Exception as e:
         logging.warning(f"Failed to notify borrower: {e}")
-
-    # Optional extra nudge to lender with the @tag text-only
-    try:
-        lender_chat_id = int(listing["owner_id"])
-        if borrower_username:
-            at_tag_e = esc_md2(f"@{borrower_username}")
-            msg = f"{esc_md2(tr(me, 'nice_borrower_is', username=at_tag_e))}\n\n{esc_md2(tr(me, 'nudge_text_v2'))}"
-            await context.bot.send_message(chat_id=lender_chat_id, text=msg, parse_mode="MarkdownV2")
-        else:
-            # no parse_mode here — raw tg:// link is fine
-            await context.bot.send_message(
-                chat_id=lender_chat_id,
-                text=f"{tr(me, 'no_public_username')}tg://user?id={rr['borrower_id']}"
-            )
-    except Exception as e:
-        logging.warning(f"Failed to notify lender with borrower tag: {e}")
 
 async def handle_request_decline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3932,7 +3923,7 @@ if __name__ == '__main__':
     # === register ALL handlers here ===
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(set_language_from_callback, pattern=r"^set_lang_(en|pl|uk)$"))  
-    application.add_handler(CommandHandler("language", prompt_language))
+    app.add_handler(CommandHandler("language", prompt_language))
 
 
     # My Account (supports badge in () or [])
