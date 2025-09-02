@@ -101,7 +101,7 @@ LOCALES = {
         "accepted_title": "Accepted!",
         "nice_borrower_is": "🙌 Nice! The borrower is {username}.",
         # NOTE: strings below are used with MarkdownV2, keep escapes
-        "nudge_text_v2": "Great\\! Now text the borrower to agree on a convenient pickup time and place\\.\nA quick hello goes a long way 🙂",
+        "nudge_text_v2": "Great! Now text the borrower to agree on a convenient pickup time and place.\nA quick hello goes a long way 🙂",
         "no_public_username": "🙌 Nice! The borrower doesn’t have a public @username.\n\nGreat! Now text the borrower to agree on a convenient pickup time and place:\n",
         "request_declined": "Request declined",
         "request_declined_borrower": "😕 Your request for *{item}* was declined",
@@ -154,7 +154,7 @@ LOCALES = {
         "accepted_and_booked": "Prośba zaakceptowana i dni zarezerwowane.",
         "accepted_title": "Zaakceptowano!",
         "nice_borrower_is": "🙌 Super! Wypożyczający to {username}.",
-        "nudge_text_v2": "Świetnie\\! Napisz teraz do wypożyczającego, aby ustalić termin i miejsce odbioru\\.\nKrótka wiadomość wiele znaczy 🙂",
+        "nudge_text_v2": "Świetnie! Teraz napisz do wypożyczającego, aby ustalić dogodny czas i miejsce odbioru.\nKrótka wiadomość wiele znaczy 🙂",
         "no_public_username": "🙌 Super! Wypożyczający nie ma publicznej nazwy użytkownika.\n\nNapisz do niego, aby ustalić szczegóły odbioru:\n",
         "request_declined": "Prośba odrzucona",
         "request_declined_borrower": "😕 Twoja prośba o *{item}* została odrzucona",
@@ -206,7 +206,7 @@ LOCALES = {
         "accepted_and_booked": "Заявку прийнято, дні заброньовано.",
         "accepted_title": "Прийнято!",
         "nice_borrower_is": "🙌 Клас! Орендар — {username}.",
-        "nudge_text_v2": "Чудово\\! Напишіть орендарю, щоб узгодити час і місце видачі\\.\nКоротке привітання — гарний початок 🙂",
+        "nudge_text_v2": "Чудово! Тепер напишіть орендареві, щоб узгодити зручні час і місце передачі.\nКоротке привітання — це завжди доречно 🙂",
         "no_public_username": "🙌 Клас! У орендаря немає публічного @username.\n\nНапишіть йому, щоб узгодити деталі видачі:\n",
         "request_declined": "Заявку відхилено",
         "request_declined_borrower": "😕 Вашу заявку на *{item}* відхилено",
@@ -1134,9 +1134,14 @@ async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
-    me = str(update.effective_user.id)
-    req_id = q.data.split("_", 2)[2]
+    if not q:
+        return
+
+    me = str(q.from_user.id)  # <-- define before using "me"
+    await q.answer(tr(me, "accepted_and_booked"), show_alert=True)  # nice popup
+
+    data = q.data or ""
+    req_id = data.split("_", 2)[-1]
 
     rr_list = supabase.table("rental_requests").select("*").eq("id", req_id).execute().data
     if not rr_list:
@@ -1711,17 +1716,27 @@ async def browse_prev_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_browse_listing(update_or_query, context):
     listings = context.user_data.get("matched_listings", [])
     index = context.user_data.get("browse_index", 0)
-    
     if not listings:
         return
 
-    # Figure out user id for localization (works for both Message and CallbackQuery)
-    if getattr(update_or_query, "callback_query", None):
-        me = str(update_or_query.callback_query.from_user.id)
+    # --- unify who/where we’re replying to (works for Update or raw CallbackQuery) ---
+    q = getattr(update_or_query, "callback_query", None)
+    if q is not None:
+        # Case: Update with a callback_query
+        me = str(q.from_user.id)
+        chat = q.message.chat
+    elif hasattr(update_or_query, "from_user") and hasattr(update_or_query, "message"):
+        # Case: raw CallbackQuery was passed in directly
+        q = update_or_query
+        me = str(q.from_user.id)
+        chat = q.message.chat
     else:
+        # Case: plain Update (no callback)
         me = str(update_or_query.effective_user.id)
+        chat = update_or_query.effective_chat
 
     listing = listings[index]
+
     # Quick wordlist guard for legacy content (optional)
     joined_text = " ".join(filter(None, [
         nz(listing.get("category")),
@@ -1732,22 +1747,22 @@ async def send_browse_listing(update_or_query, context):
         location_name_from_coords(nz(listing.get("location"))),
     ])).strip()
     if _bad_word_hit(joined_text):
-        # Skip this listing by auto-advancing; if all are bad, it will just show none.
         nxt = index + 1
         context.user_data["browse_index"] = nxt
         if nxt < len(listings):
             return await send_browse_listing(update_or_query, context)
-        else:
-            # At end; quietly refuse to render
-            return
+        return
 
     photos = coerce_list(listing.get("photos"))
     title  = listing.get("item") or "Item"
     specs  = coerce_list(listing.get("specs"))
     cur    = listing.get("currency", "PLN")
-    not_prov = tr(str(update_or_query.effective_user.id), "not_provided")
-    cond_lbl = tr(str(update_or_query.effective_user.id), "label_condition")
-    per_day  = tr(str(update_or_query.effective_user.id), "per_day")
+
+    # 🔧 use `me` everywhere for translations (no direct effective_user access)
+    not_prov = tr(me, "not_provided")
+    cond_lbl = tr(me, "label_condition")
+    per_day  = tr(me, "per_day")
+
     def format_availability(dates):
         if not dates:
             return not_prov
@@ -1775,7 +1790,7 @@ async def send_browse_listing(update_or_query, context):
     price_e = esc_md2(f"{float(listing.get('price_per_day', 0)):.2f}")
     cur_e   = esc_md2(cur)
     loc_raw = listing.get("location") or ""
-    loc_e = esc_md2(location_name_from_coords(loc_raw))
+    loc_e   = esc_md2(location_name_from_coords(loc_raw))
     avail_e = esc_md2(availability_str)
 
     msg = (
@@ -1798,12 +1813,9 @@ async def send_browse_listing(update_or_query, context):
         buttons.append(InlineKeyboardButton(tr(me, "btn_next"), callback_data="browse_next"))
     reply_markup = InlineKeyboardMarkup([buttons])
 
-    # --- Callback case (Next/Prev): delete old media + text, then re-send like before ---
-    if getattr(update_or_query, "callback_query", None):
-        query = update_or_query.callback_query
-        await query.answer()
-        chat = query.message.chat
-
+    # --- Callback case (works for Update.callback_query OR raw CallbackQuery) ---
+    if q is not None:
+        await q.answer()
         # delete old media group
         for msg_id in context.user_data.get("browse_media_ids", []):
             try:
@@ -1814,11 +1826,11 @@ async def send_browse_listing(update_or_query, context):
 
         # delete old text message
         try:
-            await query.message.delete()
+            await q.message.delete()
         except Exception as e:
             print(f"[browse] failed to delete text message: {e}")
 
-        # send photos (like before)
+        # send photos
         if photos:
             media_group = await chat.send_media_group([InputMediaPhoto(p) for p in photos[:3]])
             context.user_data["browse_media_ids"] = [m.message_id for m in media_group]
@@ -1828,7 +1840,7 @@ async def send_browse_listing(update_or_query, context):
         # send text card
         await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
 
-    # --- First render (message case): reply with media group + text, store IDs for later deletion ---
+    # --- First render (message case): reply with media group + text ---
     else:
         context.user_data["browse_media_ids"] = []
         if photos:
@@ -3625,10 +3637,33 @@ async def rent_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.edit_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def rent_back_to_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Re-render the current listing card
+
     q = update.callback_query
+    if not q:
+        return
     await q.answer()
-    await send_browse_listing(update, context)
+
+    me = str(q.from_user.id)
+    data = (q.data or "").strip()
+
+    # Use the existing browse collection, don't overwrite it
+    listings = context.user_data.get("matched_listings", [])
+
+    # If we carried the listing id in the callback, move the cursor to it
+    if data.startswith("rent_back_to_listing_"):
+        target_id = data.split("rent_back_to_listing_", 1)[1]
+        for i, l in enumerate(listings or []):
+            if str(l.get("id")) == str(target_id):
+                context.user_data["browse_index"] = i
+                break
+
+    # If we have a collection, show it
+    if listings:
+        return await send_browse_listing(update, context)
+
+    # Fallback: no collection in memory (e.g., user came from deep link or fresh session)
+    # Send them back to the browse/search entry point
+    return await handle_browse(update, context)
 
 async def rent_year_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3803,7 +3838,7 @@ async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt,
         parse_mode="MarkdownV2",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(tr(me, "back_to_listing_btn"), callback_data="rent_back_to_listing")]]
+            [[InlineKeyboardButton(tr(me, "back_to_listing_btn"), callback_data=f"rent_back_to_listing_{listing_id}")]]
         ),
     )
 
@@ -3971,7 +4006,7 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(rent_choose_year,     pattern=r"^rent_year_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_choose_month,    pattern=r"^rent_month_[0-9a-fA-F-]{36}_(2025|2026)$"))
     app.add_handler(CallbackQueryHandler(rent_pick_day,        pattern=r"^rent_pick_[0-9a-fA-F-]{36}_.+$"))
-    app.add_handler(CallbackQueryHandler(rent_back_to_listing, pattern=r"^rent_back_to_listing$"))
+    app.add_handler(CallbackQueryHandler(rent_back_to_listing, pattern=r"^rent_back_to_listing(?:_.+)?$"))
     app.add_handler(CallbackQueryHandler(rent_year_back,       pattern=r"^rent_year_back$"))
     app.add_handler(CallbackQueryHandler(rent_month_back,      pattern=r"^rent_month_back_[0-9a-fA-F-]{36}_(2025|2026)$"))
     app.add_handler(CallbackQueryHandler(noop,                 pattern=r"^noop$"))
