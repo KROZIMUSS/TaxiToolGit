@@ -227,8 +227,6 @@ LOCALES = {
 
 # === i18n helpers (sync) ===
 
-# === i18n helpers (sync) ===
-
 DEFAULT_LANG = "en"
 LANG_CACHE: Dict[str, str] = {}
 
@@ -811,12 +809,6 @@ async def set_language_from_callback(update: Update, context: ContextTypes.DEFAU
 
 
 # === Start Command ===
-# Keep these helpers as they are:
-# - get_user_lang(uid)
-# - set_user_lang(uid, lang)
-# - lang_keyboard()
-# - tr(uid, key)
-# - main_menu_keyboard()  (or whatever you use to show the home menu)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
@@ -2922,7 +2914,7 @@ _I18N_CREATE_RENT_PATCH = {
         "photos_thanks": "Thanks! Photos received.",
         "share_location_or_type": "Now share your location or type it manually:",
         "could_not_recognize_location": "❗ Could not recognize that location. Please try again with a valid city.",
-        "availability_prompt": "Please type your availability in this format:\nDD/MM/YYYY - DD/MM/YYYY, DD/MM/YYYY - DD/MM/YYYY",
+        "availability_prompt": "Please type your availability in this format:\n01.01.2026 - 15.01.2026, 20.01.2026 - 30.01.2026",
         "availability_end_before_start": "❗ End date {end} is before start date {start}. Please try again.",
         "availability_parse_fail": (
             "❗ I couldn't find any valid ranges.\n"
@@ -2982,7 +2974,7 @@ _I18N_CREATE_RENT_PATCH = {
         "photos_thanks": "Dzięki! Zdjęcia odebrane.",
         "share_location_or_type": "Udostępnij swoją lokalizację lub wpisz ją ręcznie:",
         "could_not_recognize_location": "❗ Nie rozpoznano lokalizacji. Spróbuj ponownie, podając poprawne miasto.",
-        "availability_prompt": "Podaj dostępność w formacie:\nDD/MM/RRRR - DD/MM/RRRR, DD/MM/RRRR - DD/MM/RRRR",
+        "availability_prompt": "Podaj dostępność w formacie:\n01.01.2026 - 15.01.2026, 20.01.2026 - 30.01.2026",
         "availability_end_before_start": "❗ Data końcowa {end} jest przed początkową {start}. Spróbuj ponownie.",
         "availability_parse_fail": (
             "❗ Nie znaleziono prawidłowych zakresów.\n"
@@ -3026,7 +3018,7 @@ _I18N_CREATE_RENT_PATCH = {
     },
     "uk": {
         # Create flow
-        "create_pick_category": "Оберіть категорію з кнопок нижче або напишіть у чаті:",
+        "create_pick_category": "Оберіть категорію нижче або напишіть у чаті:",
         "create_item_prompt_with_examples": (
             "Укажіть назву предмета та, за можливості, бренд і модель.\n"
             "Приклади:\n"
@@ -3042,7 +3034,7 @@ _I18N_CREATE_RENT_PATCH = {
         "photos_thanks": "Дякую! Фото отримано.",
         "share_location_or_type": "Надішліть свою локацію або введіть її вручну:",
         "could_not_recognize_location": "❗ Не вдалося розпізнати локацію. Спробуйте ще раз, вказавши коректне місто.",
-        "availability_prompt": "Вкажіть доступність у форматі:\nDD/MM/YYYY - DD/MM/YYYY, DD/MM/YYYY - DD/MM/YYYY",
+        "availability_prompt": "Вкажіть доступність у форматі:\n01.01.2026 - 15.01.2026, 20.01.2026 - 30.01.2026",
         "availability_end_before_start": "❗ Кінцева дата {end} раніше початкової {start}. Спробуйте ще раз.",
         "availability_parse_fail": (
             "❗ Не знайшов жодних коректних проміжків.\n"
@@ -3395,7 +3387,10 @@ async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(tr(me, "could_not_recognize_location"))
             return GET_LOCATION
 
-    await update.message.reply_text(tr(me, "availability_prompt"))
+    await update.message.reply_text(
+        tr(me, "availability_prompt"),
+        reply_markup=ReplyKeyboardRemove()
+    )
     return GET_AVAILABILITY
 
 async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
