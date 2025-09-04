@@ -18,6 +18,7 @@ import base64
 import asyncio
 from functools import lru_cache
 from typing import Dict
+from postgrest.exceptions import APIError as PostgrestAPIError
 
 #Check
 # === Configuration ===
@@ -286,6 +287,29 @@ def lang_keyboard() -> InlineKeyboardMarkup:
 geolocator = Nominatim(user_agent="rento-to-bot/1.0 (contact: RentoToBOT@gmail.com)", timeout=5)
 geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1, max_retries=2)
 reverse = RateLimiter(geolocator.reverse, min_delay_seconds=1, max_retries=2)
+
+async def supa_exec_with_retry(op, tries: int = 3, base_delay: float = 0.7):
+    """
+    Run a synchronous PostgREST .execute() call with simple async retries.
+    Use: await supa_exec_with_retry(lambda: supabase.table(...).insert(...).execute())
+    """
+    for i in range(tries):
+        try:
+            return op()
+        except PostgrestAPIError as e:
+            # When Cloudflare/Supabase briefly fails, PostgREST wraps it as APIError
+            # and sometimes the 'details' contains an HTML page. Retry those.
+            text = f"{getattr(e, 'message', '')} {getattr(e, 'details', '')}"
+            transient = (
+                "DOCTYPE html" in text
+                or "Could not find host" in text
+                or "timed out" in text.lower()
+            )
+            if transient and i < tries - 1:
+                await asyncio.sleep(base_delay * (2 ** i))
+                continue
+            logging.exception("Supabase error (no more retries)")
+            raise
 
 @lru_cache(maxsize=2000)
 def _loc_label_cached(input_str: str) -> str:
@@ -2222,9 +2246,9 @@ _I18N_EDIT_PATCH = {
         "photo_invalid_number": "Неправильний номер.",
         "photo_type_delete": "Напишіть напр. 'Delete 1'.",
         "photos_cleared": "Усі фото очищено.",
-        "photos_already_three": "У вас вже 3 фото. Видаліть одне або введіть 'Done'.",
+        "photos_already_three": "У вас вже 3 фото. Видаліть одне або натисніть 'Продовжити'.",
         "photo_rejected": "🚫 Фото відхилено: {why}. Надішліть інше.",
-        "photo_added": "Додано. Зараз: {n}. Можна додати ще {remaining}, або введіть 'Done'.",
+        "photo_added": "Додано. Зараз: {n}. Можна додати ще {remaining}, або натисніть 'Продовжити'.",
         "photos_send_prompt": "Надішліть фото або введіть Delete X / Clear / Done / Cancel.",
         "photos_updated": "✅ Фото оновлено.",
         # edit field prompts
@@ -3487,20 +3511,27 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pre_existing = supabase.table("listings").select("id").eq("owner_id", user_id).limit(1).execute()
     is_first_listing = not pre_existing.data
 
-    supabase.table("listings").insert({
-        "owner_id": user_id,
-        "category": context.user_data['category'],
-        "description": context.user_data['description'],
-        "item": context.user_data.get("item_title"),
-        "specs": context.user_data.get("specs"),
-        "condition": context.user_data['condition'],
-        "price_per_day": context.user_data['price_per_day'],
-        "currency": context.user_data.get("currency", "PLN"),
-        "photos": context.user_data['photos'],
-        "location": context.user_data['location'],
-        "availability": availability,
-        "embedding": embedding
-    }).execute()
+    try:
+        await supa_exec_with_retry(lambda: supabase.table("listings").insert({
+            "owner_id": me,
+            "title": item_title,
+            "category": category,
+            "item": item_title,
+            "description": description,
+            "condition": condition,
+            "specs": specs,
+            "price_per_day": price_per_day,
+            "currency": currency,
+            "location": location,
+            "availability": availability,   # list of "YYYY-MM-DD"
+            "photos": photos,
+            "embedding": embedding,
+        }).execute())
+    except PostgrestAPIError:
+        # Friendly fallback instead of crashing the conversation
+        await update.message.reply_text(tr(me, "something_wrong"))
+        return ConversationHandler.END
+
 
     if is_first_listing:
         context.user_data["awaiting_insurance_feedback"] = True
