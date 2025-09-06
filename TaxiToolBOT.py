@@ -19,6 +19,7 @@ import asyncio
 from functools import lru_cache
 from typing import Dict
 from postgrest.exceptions import APIError as PostgrestAPIError
+import uuid
 
 #Check
 # === Configuration ===
@@ -1812,7 +1813,7 @@ async def send_browse_listing(update_or_query, context):
         return
 
     photos = coerce_list(listing.get("photos"))
-    title  = listing.get("item") or "Item"
+    title  = listing.get("item") or "Item" or listing.get("title")
     specs  = coerce_list(listing.get("specs"))
     cur    = listing.get("currency", "PLN")
 
@@ -1943,7 +1944,7 @@ async def send_single_listing(update_or_query, context):
         return "\n".join(result)
 
     availability_str = format_availability(listing.get("availability"))
-    title = listing.get("item") or "Item"
+    title = listing.get("item") or "Item" or listing.get("title")
     specs = coerce_list(listing.get("specs"))
     cur = listing.get("currency", "PLN")
     cat_e   = esc_md2(listing.get('category', ''))
@@ -3507,42 +3508,104 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"[Embeddings] Create flow → input='{embedding_input[:160]}...'")
     embedding = await generate_embedding(embedding_input)
 
-    # Is first listing?
-    pre_existing = supabase.table("listings").select("id").eq("owner_id", user_id).limit(1).execute()
-    is_first_listing = not pre_existing.data
+    # ---- gather all fields from the create flow safely ----
+    category    = context.user_data.get("category") or ""
+    item_title  = context.user_data.get("item_title") or context.user_data.get("title") or "Untitled"
+    brand_model = context.user_data.get("brand_model") or None
+    specs       = context.user_data.get("specs") or []
+    tags        = context.user_data.get("tags") or []
+    location    = context.user_data.get("location") or ""
+    description = context.user_data.get("description") or ""
+    condition   = context.user_data.get("condition") or ""
+    price       = float(context.user_data.get("price_per_day") or 0)
+    currency    = (context.user_data.get("currency") or "PLN").upper()
+    photos      = (context.user_data.get("photos") or [])[:3]
+
+    # Safety: ensure a users row exists for FK (owner_id -> users.id)
+    try:
+        me = str(update.effective_user.id)
+        rows = supabase.table("users").select("id").eq("id", me).limit(1).execute().data
+        if not rows:
+            supabase.table("users").insert({
+                "id": me,
+                "telegram_username": update.effective_user.username or None,
+                "display_name": (update.effective_user.full_name or update.effective_user.first_name or "").strip() or None,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                # nice to have: store last known location if you have it
+                "location": (context.user_data.get("location") or None)
+            }).execute()
+    except Exception as e:
+        logging.warning(f"[create] ensure user row failed: {e}")
 
     try:
-        await supa_exec_with_retry(lambda: supabase.table("listings").insert({
-            "owner_id": me,
-            "title": item_title,
-            "category": category,
-            "item": item_title,
-            "description": description,
-            "condition": condition,
-            "specs": specs,
-            "price_per_day": price_per_day,
-            "currency": currency,
-            "location": location,
-            "availability": availability,   # list of "YYYY-MM-DD"
-            "photos": photos,
-            "embedding": embedding,
-        }).execute())
-    except PostgrestAPIError:
-        # Friendly fallback instead of crashing the conversation
-        await update.message.reply_text(tr(me, "something_wrong"))
-        return ConversationHandler.END
-
-
-    if is_first_listing:
-        context.user_data["awaiting_insurance_feedback"] = True
-        await update.message.reply_text(
-            tr(me, "insurance_q"),
-            reply_markup=main_menu_keyboard(user_id)
+        had_listings = bool(
+            supabase.table("listings")
+            .select("id")
+            .eq("owner_id", me)
+            .limit(1)
+            .execute()
+            .data
         )
-        return ConversationHandler.END
-    else:
-        await update.message.reply_text(tr(me, "listing_created"), reply_markup=main_menu_keyboard(user_id))
-        return await go_back(update, context)
+    except Exception:
+        had_listings = True  # fail-safe: assume not first if query fails
+
+    # build idem
+    idem = context.user_data.get("create_idem_key")
+    if not idem:
+        idem = uuid.uuid4().hex
+        context.user_data["create_idem_key"] = idem
+
+    payload = {
+        "owner_id": me,
+        "category": category,
+        "item": item_title,
+        "brand_model": brand_model,
+        "specs": specs,
+        "tags": tags,
+        "description": description,
+        "condition": condition,
+        "price_per_day": price,
+        "currency": currency,
+        "photos": photos,
+        "location": location,
+        "availability": availability,
+        "booked_days": [],
+        "embedding": embedding,
+        "idempotency_key": idem,
+    }
+
+    # ✅ single idempotent write
+    await supa_exec_with_retry(
+        lambda: supabase.table("listings")
+            .upsert(payload, on_conflict="idempotency_key")
+            .execute()
+    )
+    context.user_data.pop("create_idem_key", None)
+    
+    # tidy up the create-flow state but leave unrelated user_data (e.g., language) intact
+    for k in (
+        "category","item_title","brand_model","specs","tags","description","condition",
+        "price_per_day","currency","photos","location","availability"
+    ):
+        context.user_data.pop(k, None)
+
+    await update.message.reply_text(
+        tr(me, "listing_created"),
+        reply_markup=main_menu_keyboard(me)
+    )
+
+    # Optional quick feedback question (safe to ignore if you don't want it)
+    if not had_listings:
+        try:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("👍", callback_data="ins_yes"),
+                InlineKeyboardButton("👎", callback_data="ins_no")]
+            ])
+            await update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb)
+        except Exception:
+            pass
+
+    return ConversationHandler.END
 
 async def handle_insurance_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
@@ -3551,6 +3614,29 @@ async def handle_insurance_feedback(update: Update, context: ContextTypes.DEFAUL
     else:
         await update.message.reply_text(tr(me, "insurance_no"))
     return await go_back(update, context)
+
+async def handle_insurance_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    me = str(q.from_user.id)
+
+    choice = (q.data == "ins_yes")
+    context.user_data["insurance_opt_in"] = choice
+
+    # Acknowledge and remove inline buttons, so user can't tap twice
+    try:
+        await q.answer("Saved ✅")
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # ✅ Send a simple reply (no prefix appended to the original question)
+    try:
+        msg_key = "insurance_yes" if choice else "insurance_no"
+        await q.message.chat.send_message(tr(me, msg_key))
+    except Exception:
+        pass
 
 # ===== Rental flow (Year -> Month -> Range -> Day) =====
 async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4052,6 +4138,8 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(handle_request_decline, pattern=r"^req_decline_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(show_lending_schedule,   pattern=r"^schedule_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(schedule_back_to_listing, pattern=r"^schedule_back_[0-9a-fA-F-]{36}$"))
+    app.add_handler(CallbackQueryHandler(handle_insurance_choice, pattern=r"^ins_(?:yes|no)$"))
+
 
     # Conversations/handlers 
     app.add_handler(listing_conv)
