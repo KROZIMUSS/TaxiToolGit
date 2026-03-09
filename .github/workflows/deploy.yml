@@ -50,7 +50,7 @@ jobs:
             --allow-unauthenticated \
             --memory 512Mi \
             --cpu 1 \
-            --min-instances 0 \
+            --min-instances 3 \
             --max-instances 10 \
             --port 8080 \
             --set-env-vars MODE=webhook \
