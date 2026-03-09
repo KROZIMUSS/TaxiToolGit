@@ -36,6 +36,8 @@ SUPABASE_URL       = require_env("SUPABASE_URL")
 SUPABASE_KEY       = require_env("SUPABASE_KEY")
 OPENAI_KEY         = require_env("OPENAI_KEY")
 
+WEBHOOK_MODE = os.getenv("MODE", "polling") == "webhook"  # True on Cloud Run
+
 # === Initialize clients (with clear error logging) ===
 try:
     aclient = AsyncOpenAI(api_key=OPENAI_KEY)
@@ -362,7 +364,7 @@ async def safe_send(func, *args, **kwargs):
     try:
         return await func(*args, **kwargs)
     except RetryAfter as e:
-        if os.getenv("MODE", "polling") == "webhook":
+        if WEBHOOK_MODE:
             logging.warning(f"[send] rate limited in webhook mode, not retrying: {e}")
             raise
         # Telegram is throttling — wait the suggested time
@@ -4348,12 +4350,21 @@ if __name__ == '__main__':
         async def on_startup(aiohttp_app_instance):
             # Initialize and start the PTB application inside the aiohttp event loop
             # so all async resources (HTTP client, etc.) share the same running loop.
-            await app.initialize()
-            await app.start()
+            try:
+                await app.initialize()
+                await app.start()
+                print("[startup] PTB application initialized and started.")
+            except Exception as e:
+                print(f"[startup] CRITICAL: PTB application failed to start: {e}")
+                raise
 
         async def on_cleanup(aiohttp_app_instance):
-            await app.stop()
-            await app.shutdown()
+            try:
+                await app.stop()
+                await app.shutdown()
+                print("[cleanup] PTB application stopped.")
+            except Exception as e:
+                print(f"[cleanup] Error stopping PTB application: {e}")
 
         async def health_handler(request):
             return Response(text='OK', status=200)
