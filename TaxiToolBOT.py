@@ -353,10 +353,18 @@ async def async_reverse(latlon):
 _MD2_SPECIAL = r'[_*[\]()~`>#+\-=|{}.!]'
 
 async def safe_send(func, *args, **kwargs):
-    """Call a PTB send/edit method with minimal retries."""
+    """Call a PTB send/edit method with minimal retries.
+
+    In webhook mode (MODE=webhook) retries are skipped entirely to avoid
+    blocking the aiohttp event loop with asyncio.sleep(), which can trigger
+    'Event loop is closed' errors on Cloud Run.
+    """
     try:
         return await func(*args, **kwargs)
     except RetryAfter as e:
+        if os.getenv("MODE", "polling") == "webhook":
+            logging.warning(f"[send] rate limited in webhook mode, not retrying: {e}")
+            raise
         # Telegram is throttling — wait the suggested time
         await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
         try:
@@ -407,20 +415,20 @@ async def edit_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = getattr(update, "callback_query", None)
         if q:
             await q.answer()
-            await q.message.edit_text(tr(me, "no_listing_in_ctx"))
+            context.application.create_task(q.message.edit_text(tr(me, "no_listing_in_ctx")), update=update)
         else:
             if update.message:
-                await update.message.reply_text(tr(me, "no_listing_in_ctx"))
+                context.application.create_task(update.message.reply_text(tr(me, "no_listing_in_ctx")), update=update)
         return ConversationHandler.END
 
     kb = build_edit_menu_keyboard(me)
     q = getattr(update, "callback_query", None)
     if q:
         await q.answer()
-        await q.message.edit_text(tr(me, "edit_what"), reply_markup=kb)
+        context.application.create_task(q.message.edit_text(tr(me, "edit_what"), reply_markup=kb), update=update)
     else:
         if update.message:
-            await update.message.reply_text(tr(me, "edit_what"), reply_markup=kb)
+            context.application.create_task(update.message.reply_text(tr(me, "edit_what"), reply_markup=kb), update=update)
     return EDIT_CHOICE
 
 CANON_CATEGORIES = [
@@ -816,9 +824,12 @@ async def moderate_telegram_photo(file_id: str, bot) -> tuple[bool, str]:
 # /language
 async def prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    await update.message.reply_text(
-    tr(me, "choose_language"),
-    reply_markup=lang_keyboard()
+    context.application.create_task(
+        update.message.reply_text(
+        tr(me, "choose_language"),
+        reply_markup=lang_keyboard()
+        ),
+        update=update
     )
 
 # set_lang_<xx> callback
@@ -831,9 +842,12 @@ async def set_language_from_callback(update: Update, context: ContextTypes.DEFAU
     if lang not in ("en", "pl", "uk"):
         lang = "en"
     set_user_lang(me, lang)
-    await q.message.reply_text(
-    tr(me, "greeting"),
-    reply_markup=main_menu_keyboard(me)
+    context.application.create_task(
+        q.message.reply_text(
+        tr(me, "greeting"),
+        reply_markup=main_menu_keyboard(me)
+        ),
+        update=update
     )
 
 
@@ -870,9 +884,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         # Show language picker only once (on first start)
-        await update.effective_message.reply_text(
-            tr(me, "choose_language"),
-            reply_markup=lang_keyboard()
+        context.application.create_task(
+            update.effective_message.reply_text(
+                tr(me, "choose_language"),
+                reply_markup=lang_keyboard()
+            ),
+            update=update
         )
         return
 
@@ -881,16 +898,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     LANG_CACHE[me] = saved  # refresh cache; do NOT set to 'en'
 
     # 4) Show your normal home/menu in the user’s current language
-    await update.effective_message.reply_text(
-        tr(me, "home_tip"),
-        reply_markup=main_menu_keyboard(me)
+    context.application.create_task(
+        update.effective_message.reply_text(
+            tr(me, "home_tip"),
+            reply_markup=main_menu_keyboard(me)
+        ),
+        update=update
     )
 
 
 # === Back to Menu ===
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    await update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me))
+    context.application.create_task(update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me)), update=update)
     return ConversationHandler.END
 
 # === My Account ===
@@ -964,7 +984,7 @@ async def handle_my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # CHANGED: use your purchase label from _I18N_PURCHASE_PATCH
         [InlineKeyboardButton(tr(me, "btn_purchase"), callback_data="shop_open")]
     ])
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    context.application.create_task(update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb), update=update)
 
 async def account_my_borrowings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -978,7 +998,7 @@ async def account_my_borrowings(update: Update, context: ContextTypes.DEFAULT_TY
         .execute().data or []
 
     if not rrs:
-        await q.message.edit_text(tr(me, "no_upcoming_borrowings"))
+        context.application.create_task(q.message.edit_text(tr(me, "no_upcoming_borrowings")), update=update)
         return
 
     # Gather upcoming days per listing
@@ -994,7 +1014,7 @@ async def account_my_borrowings(update: Update, context: ContextTypes.DEFAULT_TY
             by_listing.setdefault(rr["listing_id"], set()).update(keep)
 
     if not by_listing:
-        await q.message.edit_text(tr(me, "no_upcoming_borrowings"))
+        context.application.create_task(q.message.edit_text(tr(me, "no_upcoming_borrowings")), update=update)
         return
 
     # Fetch listings and owners
@@ -1027,15 +1047,18 @@ async def account_my_borrowings(update: Update, context: ContextTypes.DEFAULT_TY
         blocks.append(block)
 
     if not rrs or not by_listing:
-        await q.message.edit_text(
-            tr(me, "no_upcoming_borrowings"),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")]])
+        context.application.create_task(
+            q.message.edit_text(
+                tr(me, "no_upcoming_borrowings"),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")]])
+            ),
+            update=update
         )
         return
 
     text = "📅 *" + esc_md2(tr(me, "btn_upcoming_borrowings").replace("📅 ", "")) + "*\n\n" + "\n\n".join(blocks)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")]])
-    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+    context.application.create_task(q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb), update=update)
 
 async def account_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1091,7 +1114,7 @@ async def account_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # CHANGED: same as above
         [InlineKeyboardButton(tr(me, "btn_purchase"), callback_data="shop_open")]
     ])
-    await q.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    context.application.create_task(q.message.edit_text(text, parse_mode="Markdown", reply_markup=kb), update=update)
 
 async def account_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1102,9 +1125,12 @@ async def account_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rr = supabase.table("rental_requests").select("*").eq("lender_id", me).eq("status", "pending")\
          .order("created_at", desc=False).execute().data or []
     if not rr:
-        await q.message.edit_text(
-            tr(me, "no_outstanding_requests"),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")]])
+        context.application.create_task(
+            q.message.edit_text(
+                tr(me, "no_outstanding_requests"),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")]])
+            ),
+            update=update
         )
         return
 
@@ -1128,7 +1154,7 @@ async def account_req_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     arr = context.user_data.get("pending_reqs", [])
     if not arr:
-        await q.message.edit_text("No requests.")
+        context.application.create_task(q.message.edit_text("No requests."), update=update)
         return
     context.user_data["pending_req_idx"] = (context.user_data.get("pending_req_idx", 0) + 1) % len(arr)
     await _show_request_card(q, context)
@@ -1138,7 +1164,7 @@ async def account_req_prev(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     arr = context.user_data.get("pending_reqs", [])
     if not arr:
-        await q.message.edit_text("No requests.")
+        context.application.create_task(q.message.edit_text("No requests."), update=update)
         return
     context.user_data["pending_req_idx"] = (context.user_data.get("pending_req_idx", 0) - 1) % len(arr)
     await _show_request_card(q, context)
@@ -1149,7 +1175,7 @@ async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE
     arr = context.user_data.get("pending_reqs", [])
     idx = context.user_data.get("pending_req_idx", 0)
     if not arr:
-        await q.message.edit_text(tr(me, "no_outstanding_requests"))
+        context.application.create_task(q.message.edit_text(tr(me, "no_outstanding_requests")), update=update)
         return
 
     req = arr[idx]
@@ -1193,7 +1219,7 @@ async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE
         kb.append(nav)
     kb.append([InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")])
 
-    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
+    context.application.create_task(q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb)), update=update)
 
 async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1208,11 +1234,14 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
 
     rr_list = supabase.table("rental_requests").select("*").eq("id", req_id).execute().data
     if not rr_list:
-        await q.message.edit_text(
-            tr(me, "request_not_found"),
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
-            )
+        context.application.create_task(
+            q.message.edit_text(
+                tr(me, "request_not_found"),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+                )
+            ),
+            update=update
         )
         return
     rr = rr_list[0]
@@ -1259,26 +1288,32 @@ async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TY
         f"{esc_md2(tr(me, 'nudge_text_v2'))}"
     )
 
-    await q.message.edit_text(
-        text,
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(tr(me, 'back_to_requests'), callback_data='account_requests')]]
+    context.application.create_task(
+        q.message.edit_text(
+            text,
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(tr(me, 'back_to_requests'), callback_data='account_requests')]]
+            ),
         ),
+        update=update
     )
 
     # 5) Notify borrower
     try:
         borrower_id = int(rr["borrower_id"])
-        await context.bot.send_message(
-            chat_id=borrower_id,
-            text=(
-                f"🎉 *{esc_md2(tr(str(borrower_id), 'accepted_title'))}*\n\n"
-                f"🏷️ *{item_e}*\n"
-                f"📅\n{ranges_e}\n"
-                f"💰 {esc_md2(tr(str(borrower_id), 'price_total'))}: {tot_e} {cur_e}"
+        context.application.create_task(
+            context.bot.send_message(
+                chat_id=borrower_id,
+                text=(
+                    f"🎉 *{esc_md2(tr(str(borrower_id), 'accepted_title'))}*\n\n"
+                    f"🏷️ *{item_e}*\n"
+                    f"📅\n{ranges_e}\n"
+                    f"💰 {esc_md2(tr(str(borrower_id), 'price_total'))}: {tot_e} {cur_e}"
+                ),
+                parse_mode="MarkdownV2"
             ),
-            parse_mode="MarkdownV2"
+            update=update
         )
     except Exception as e:
         logging.warning(f"Failed to notify borrower: {e}")
@@ -1291,23 +1326,29 @@ async def handle_request_decline(update: Update, context: ContextTypes.DEFAULT_T
 
     rr_list = supabase.table("rental_requests").select("*").eq("id", req_id).execute().data
     if not rr_list:
-        await q.message.edit_text(
-            tr(me, "request_not_found"),
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+        context.application.create_task(
+            q.message.edit_text(
+                tr(me, "request_not_found"),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+                ),
             ),
+            update=update
         )
         return
     rr = rr_list[0]
 
     supabase.table("rental_requests").update({"status": "declined"}).eq("id", req_id).execute()
 
-    await q.message.edit_text(
-        f"❌ {tr(me, 'request_declined')}",
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+    context.application.create_task(
+        q.message.edit_text(
+            f"❌ {tr(me, 'request_declined')}",
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(tr(me, "back_to_requests"), callback_data="account_requests")]]
+            ),
         ),
+        update=update
     )
 
     # Try to notify borrower (escape item name)
@@ -1315,10 +1356,13 @@ async def handle_request_decline(update: Update, context: ContextTypes.DEFAULT_T
         listing = supabase.table("listings").select("item").eq("id", rr["listing_id"]).execute().data[0]
         item_e = esc_md2((listing or {}).get("item") or "Item")
         borrower_id = int(rr["borrower_id"])
-        await context.bot.send_message(
-            chat_id=borrower_id,
-            text=tr(str(borrower_id), "request_declined_borrower", item=item_e),
-            parse_mode="MarkdownV2",
+        context.application.create_task(
+            context.bot.send_message(
+                chat_id=borrower_id,
+                text=tr(str(borrower_id), "request_declined_borrower", item=item_e),
+                parse_mode="MarkdownV2",
+            ),
+            update=update
         )
     except Exception as e:
         logging.warning(f"Failed to notify borrower about decline: {e}")
@@ -1336,7 +1380,7 @@ async def shop_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(tr(me, "purchase_back"),  callback_data="account_overview")],
     ])
     txt = f"⭐ *{tr(me,'purchase_title')}*\n\n{_quota_line_text(me)}\n\n{tr(me,'purchase_pick')}"
-    await q.message.edit_text(txt, parse_mode="Markdown", reply_markup=kb)
+    context.application.create_task(q.message.edit_text(txt, parse_mode="Markdown", reply_markup=kb), update=update)
 
 
 # replace your helper with this
@@ -1398,7 +1442,7 @@ async def payment_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # If Unlimited is active, clarify this is for after Unlimited ends
             _, _, sub_active = get_entitlement(me)
             note = " (applies when Unlimited ends)" if sub_active else ""
-            await update.message.reply_text(tr(me, "purchase_thanks_slots", limit=limit_display) + note)
+            context.application.create_task(update.message.reply_text(tr(me, "purchase_thanks_slots", limit=limit_display) + note), update=update)
 
         elif payload == "sub1m":
             row = (await run_io(lambda: supabase.table("users")
@@ -1410,13 +1454,13 @@ async def payment_success(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_io(lambda: supabase.table("users")
                          .update({"subscription_until": new_until_dt.isoformat() + "Z"})
                          .eq("id", me).execute())
-            await update.message.reply_text(tr(me, "purchase_thanks_unlm", until=new_until_dt.strftime("%Y-%m-%d")))
+            context.application.create_task(update.message.reply_text(tr(me, "purchase_thanks_unlm", until=new_until_dt.strftime("%Y-%m-%d"))), update=update)
         else:
-            await update.message.reply_text("❌")
+            context.application.create_task(update.message.reply_text("❌"), update=update)
             return
     except Exception:
         logging.exception("Purchase update failed")
-        await update.message.reply_text("❌")
+        context.application.create_task(update.message.reply_text("❌"), update=update)
         return
 
 # --- i18n additions for Settings/Browse (patch LOCALES defined above) ---
@@ -1537,7 +1581,7 @@ async def save_location_from_gps(update: Update, context: ContextTypes.DEFAULT_T
     user_id = str(update.effective_user.id)
     lat_lon = f"{loc.latitude},{loc.longitude}"
     supabase.table("users").update({"location": lat_lon}).eq("id", user_id).execute()
-    await update.message.reply_text(tr(user_id, "location_saved"), reply_markup=ReplyKeyboardRemove())
+    context.application.create_task(update.message.reply_text(tr(user_id, "location_saved"), reply_markup=ReplyKeyboardRemove()), update=update)
     return await go_back(update, context)
 
 async def save_location_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1548,13 +1592,16 @@ async def save_location_from_text(update: Update, context: ContextTypes.DEFAULT_
     if location:
         lat_lon = f"{location.latitude},{location.longitude}"
         supabase.table("users").update({"location": lat_lon}).eq("id", user_id).execute()
-        await update.message.reply_text(
-            tr(user_id, "location_saved_named", address=location.address),
-            reply_markup=ReplyKeyboardRemove()
+        context.application.create_task(
+            update.message.reply_text(
+                tr(user_id, "location_saved_named", address=location.address),
+                reply_markup=ReplyKeyboardRemove()
+            ),
+            update=update
         )
         return await go_back(update, context)
 
-    await update.message.reply_text(tr(user_id, "location_not_found"))
+    context.application.create_task(update.message.reply_text(tr(user_id, "location_not_found")), update=update)
     return AWAIT_LOCATION_CHOICE
 
 
@@ -1565,18 +1612,24 @@ async def prompt_location_choice(update: Update, context: ContextTypes.DEFAULT_T
         [tr(me, "type_location_btn")],
         [tr(me, "back")]
     ]
-    await update.message.reply_text(
-        tr(me, "prompt_location_how"),
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "prompt_location_how"),
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        ),
+        update=update
     )
     return AWAIT_LOCATION_CHOICE
 
 async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
     keyboard = [[tr(me, "settings_change_location")], [tr(me, "back")]]
-    await update.message.reply_text(
-        tr(me, "settings_title"),
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "settings_title"),
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        ),
+        update=update
     )
     return SETTINGS_MENU
 
@@ -1603,7 +1656,7 @@ async def generate_embedding(text: str):
 
 async def handle_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    await update.message.reply_text(tr(me, "browse_prompt"))
+    context.application.create_task(update.message.reply_text(tr(me, "browse_prompt")), update=update)
     return AWAIT_SEARCH_QUERY
 
 async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1645,7 +1698,7 @@ async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TY
         data = json.loads(raw_output)
     except Exception as e:
         print("LLM Output Error:", e)
-        await update.message.reply_text(tr(user_id, "couldnt_understand"))
+        context.application.create_task(update.message.reply_text(tr(user_id, "couldnt_understand")), update=update)
         return ConversationHandler.END
 
 
@@ -1735,7 +1788,7 @@ async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["browse_index"] = 0
 
     if not all_listings:
-        await update.message.reply_text(tr(user_id, "no_listings_db"))
+        context.application.create_task(update.message.reply_text(tr(user_id, "no_listings_db")), update=update)
         return ConversationHandler.END
 
     if not matched_listings:
@@ -1750,7 +1803,7 @@ async def handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TY
         if matched_listings:
             print(f"Fallback matched {len(matched_listings)} listings.")
         else:
-            await update.message.reply_text(tr(user_id, "nothing_found_try_again"))
+            context.application.create_task(update.message.reply_text(tr(user_id, "nothing_found_try_again")), update=update)
             return ConversationHandler.END
 
     await send_browse_listing(update, context)
@@ -1761,7 +1814,7 @@ async def browse_next_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     listings = context.user_data.get("matched_listings", [])
     if not listings:
-        await q.message.edit_text("No results to browse.")
+        context.application.create_task(q.message.edit_text("No results to browse."), update=update)
         return
     context.user_data["browse_index"] = (context.user_data.get("browse_index", 0) + 1) % len(listings)
     await send_browse_listing(update, context)
@@ -1771,7 +1824,7 @@ async def browse_prev_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     listings = context.user_data.get("matched_listings", [])
     if not listings:
-        await q.message.edit_text("No results to browse.")
+        context.application.create_task(q.message.edit_text("No results to browse."), update=update)
         return
     context.user_data["browse_index"] = (context.user_data.get("browse_index", 0) - 1) % len(listings)
     await send_browse_listing(update, context)
@@ -1882,14 +1935,14 @@ async def send_browse_listing(update_or_query, context):
         # delete old media group
         for msg_id in context.user_data.get("browse_media_ids", []):
             try:
-                await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+                context.application.create_task(context.bot.delete_message(chat_id=chat.id, message_id=msg_id), update=update)
             except Exception as e:
                 print(f"[browse] failed to delete media {msg_id}: {e}")
         context.user_data["browse_media_ids"] = []
 
         # delete old text message
         try:
-            await q.message.delete()
+            context.application.create_task(q.message.delete(), update=update)
         except Exception as e:
             print(f"[browse] failed to delete text message: {e}")
 
@@ -1901,7 +1954,7 @@ async def send_browse_listing(update_or_query, context):
             context.user_data["browse_media_ids"] = []
 
         # send text card
-        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        context.application.create_task(chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
 
     # --- First render (message case): reply with media group + text ---
     else:
@@ -1909,7 +1962,7 @@ async def send_browse_listing(update_or_query, context):
         if photos:
             media_messages = await update_or_query.message.reply_media_group([InputMediaPhoto(p) for p in photos[:3]])
             context.user_data["browse_media_ids"] = [m.message_id for m in media_messages]
-        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        context.application.create_task(update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
 
 
 # === View My Listings ===
@@ -1998,14 +2051,14 @@ async def send_single_listing(update_or_query, context):
         # 🧹 Delete old media messages (photos)
         for msg_id in context.user_data.get("last_media_messages", []):
             try:
-                await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+                context.application.create_task(context.bot.delete_message(chat_id=chat.id, message_id=msg_id), update=update)
             except Exception as e:
                 print(f"Failed to delete media message {msg_id}: {e}")
         context.user_data["last_media_messages"] = []
 
         # 🧹 Delete old text message (if exists)
         try:
-            await query.message.delete()
+            context.application.create_task(query.message.delete(), update=update)
         except Exception as e:
             print(f"Failed to delete main message: {e}")
 
@@ -2015,7 +2068,7 @@ async def send_single_listing(update_or_query, context):
             context.user_data["last_media_messages"] = [m.message_id for m in media_group]
 
         # 📝 Send new text block
-        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        context.application.create_task(chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
         
     # Handle Message (initial case)
     elif update_or_query.message:
@@ -2025,7 +2078,7 @@ async def send_single_listing(update_or_query, context):
         else:
             context.user_data["last_media_messages"] = []
 
-        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+        context.application.create_task(update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
 
 async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2035,7 +2088,7 @@ async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TY
 
     listing = supabase.table("listings").select("item,description").eq("id", listing_id).execute().data
     if not listing:
-        await q.message.edit_text(tr(me, "something_wrong"))
+        context.application.create_task(q.message.edit_text(tr(me, "something_wrong")), update=update)
         return
     listing = listing[0]
 
@@ -2059,7 +2112,7 @@ async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TY
 
     if not by_borrower:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back"), callback_data=f"schedule_back_{listing_id}")]])
-        await q.message.edit_text(tr(me, "no_upcoming_for_listing"), reply_markup=kb)
+        context.application.create_task(q.message.edit_text(tr(me, "no_upcoming_for_listing"), reply_markup=kb), update=update)
         return
 
     item_e = esc_md2(listing.get("item") or "Item")
@@ -2075,7 +2128,7 @@ async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TY
 
     text = f"{esc_md2(tr(me, 'lending_schedule_title'))}\n\n" + "\n\n".join(blocks)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back"), callback_data=f"schedule_back_{listing_id}")]])
-    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+    context.application.create_task(q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb), update=update)
 
 async def schedule_back_to_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2098,7 +2151,7 @@ async def view_my_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listings = result.data
 
     if not listings:
-        await update.message.reply_text("You don’t have any listings yet.")
+        context.application.create_task(update.message.reply_text("You don’t have any listings yet."), update=update)
         return
 
     context.user_data["my_listings"] = listings
@@ -2347,16 +2400,16 @@ async def receive_new_photos(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if 0 <= idx < len(buf):
                 buf.pop(idx)
                 context.user_data["edit_photos"] = buf
-                await update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)), update=update)
             else:
-                await update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)), update=update)
             return AWAIT_NEW_PHOTOS
 
         # CLEAR
         if low == tr(me, "photos_edit_clear").lower() or low == "clear":
             buf = []
             context.user_data["edit_photos"] = buf
-            await update.message.reply_text(tr(me, "photos_cleared"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me))
+            context.application.create_task(update.message.reply_text(tr(me, "photos_cleared"), reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)), update=update)
             return AWAIT_NEW_PHOTOS
 
         # DONE (commit + back to EDIT MENU)
@@ -2365,11 +2418,11 @@ async def receive_new_photos(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 supabase.table("listings").update({"photos": buf[:3]}).eq("id", listing_id).execute()
                 context.user_data.pop("photo_edit_mode", None)
                 # remove the reply keyboard, then reopen the edit menu
-                await update.message.reply_text(tr(me, "photos_updated"), reply_markup=ReplyKeyboardRemove())
+                context.application.create_task(update.message.reply_text(tr(me, "photos_updated"), reply_markup=ReplyKeyboardRemove()), update=update)
                 return await edit_menu_back(update, context)
             else:
                 # create flow doesn't use "Done" here; ignore
-                await update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me)), update=update)
                 return AWAIT_NEW_PHOTOS
 
         # CANCEL (discard staged & back to LISTING)
@@ -2382,71 +2435,89 @@ async def receive_new_photos(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     context.user_data["edit_photos"] = coerce_list((row or {}).get("photos"))
                 except Exception:
                     pass
-                await update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove())
+                context.application.create_task(update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove()), update=update)
                 return await _back_to_listing_from_edit(update, context)
             else:
                 # create flow cancel listing
                 context.user_data.clear()
-                await update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove())
+                context.application.create_task(update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove()), update=update)
                 return await go_back(update, context)
 
         # CREATE-FLOW commands preserved (not used in edit mode)
         if not in_edit_mode:
             if low == tr(me, "photos_add_more").lower():
-                await update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me)), update=update)
                 return GET_PHOTOS
             if low == tr(me, "photos_continue").lower():
-                await update.message.reply_text(
-                    tr(me, "share_location_or_type"),
-                    reply_markup=ReplyKeyboardMarkup(
-                        [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
-                          tr(me, "cancel_listing_btn")]],
-                        resize_keyboard=True
-                    )
+                context.application.create_task(
+                    update.message.reply_text(
+                        tr(me, "share_location_or_type"),
+                        reply_markup=ReplyKeyboardMarkup(
+                            [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
+                              tr(me, "cancel_listing_btn")]],
+                            resize_keyboard=True
+                        )
+                    ),
+                    update=update
                 )
                 return GET_LOCATION
             if low == tr(me, "photos_cancel_listing").lower():
                 context.user_data.clear()
-                await update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove())
+                context.application.create_task(update.message.reply_text(tr(me, "cancelled"), reply_markup=ReplyKeyboardRemove()), update=update)
                 return await go_back(update, context)
 
         # Unknown text → repeat prompt with correct keyboard
-        await update.message.reply_text(
-            tr(me, "photos_edit_help") if in_edit_mode else tr(me, "send_photo_or_cmd"),
-            reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me),
-            parse_mode="Markdown"
+        context.application.create_task(
+            update.message.reply_text(
+                tr(me, "photos_edit_help") if in_edit_mode else tr(me, "send_photo_or_cmd"),
+                reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me),
+                parse_mode="Markdown"
+            ),
+            update=update
         )
         return AWAIT_NEW_PHOTOS
 
     # --- PHOTO MEDIA ---
     if update.message and update.message.photo:
         if len(buf) >= 3:
-            await update.message.reply_text(
-                tr(me, "photos_already_three"),
-                reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)
+            context.application.create_task(
+                update.message.reply_text(
+                    tr(me, "photos_already_three"),
+                    reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)
+                ),
+                update=update
             )
             return AWAIT_NEW_PHOTOS
 
         file_id = update.message.photo[-1].file_id
         ok, why = await moderate_telegram_photo(file_id, context.bot)
         if not ok:
-            await update.message.reply_text(tr(me, "photo_rejected", why=why),
-                                            reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me))
+            context.application.create_task(
+                update.message.reply_text(tr(me, "photo_rejected", why=why),
+                                                reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)),
+                update=update
+            )
             return AWAIT_NEW_PHOTOS
 
         buf.append(file_id)
         context.user_data["edit_photos"] = buf
-        await update.message.reply_text(
-            tr(me, "photo_added", n=len(buf), remaining=max(0, 3-len(buf))),
-            reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)
+        context.application.create_task(
+            update.message.reply_text(
+                tr(me, "photo_added", n=len(buf), remaining=max(0, 3-len(buf))),
+                reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me)
+            ),
+            update=update
         )
         return AWAIT_NEW_PHOTOS
 
     # Fallback
-    await update.message.reply_text(
-        tr(me, "photos_edit_help") if in_edit_mode else tr(me, "send_photo_or_cmd"),
-        reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me),
-        parse_mode="Markdown"
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "photos_edit_help") if in_edit_mode else tr(me, "send_photo_or_cmd"),
+            reply_markup=photo_edit_keyboard(me) if in_edit_mode else photo_stage_keyboard(me),
+            parse_mode="Markdown"
+        ),
+        update=update
     )
     return AWAIT_NEW_PHOTOS
 
@@ -2533,9 +2604,12 @@ async def start_editing_listing(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["edit_listing_id"] = listing_id
 
     kb = build_edit_menu_keyboard(me)  # <-- pass user id
-    await query.message.reply_text(
-        text=tr(me, "edit_menu_title"),
-        reply_markup=kb
+    context.application.create_task(
+        query.message.reply_text(
+            text=tr(me, "edit_menu_title"),
+            reply_markup=kb
+        ),
+        update=update
     )
     return EDIT_CHOICE
 
@@ -2579,9 +2653,12 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         next_state = AWAIT_NEW_LOCATION
     elif query.data == "edit_field_category":
         context.user_data["edit_field"] = "category"
-        await query.message.reply_text(
-            tr(me, "prompt_select_category"),
-            reply_markup=category_keyboard(me)
+        context.application.create_task(
+            query.message.reply_text(
+                tr(me, "prompt_select_category"),
+                reply_markup=category_keyboard(me)
+            ),
+            update=update
         )
         return AWAIT_NEW_CATEGORY
 
@@ -2608,10 +2685,13 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         context.user_data["edit_photos"] = coerce_list((row or {}).get("photos"))
         context.user_data["photo_edit_mode"] = True  # mark edit mode
 
-        await query.message.reply_text(
-            tr(me, "photos_edit_help"),
-            reply_markup=photo_edit_keyboard(me),
-            parse_mode="Markdown"
+        context.application.create_task(
+            query.message.reply_text(
+                tr(me, "photos_edit_help"),
+                reply_markup=photo_edit_keyboard(me),
+                parse_mode="Markdown"
+            ),
+            update=update
         )
         return AWAIT_NEW_PHOTOS
 
@@ -2623,7 +2703,7 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         return EDIT_CHOICE
 
     cancel_button = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_cancel"), callback_data="cancel_edit")]])
-    await query.message.reply_text(prompt, reply_markup=cancel_button, parse_mode="Markdown")
+    context.application.create_task(query.message.reply_text(prompt, reply_markup=cancel_button, parse_mode="Markdown"), update=update)
     return next_state
 
 async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2631,11 +2711,11 @@ async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_T
     new_item = update.message.text.strip()
     ok, why = await moderate_text(new_item)
     if not ok:
-        await update.message.reply_text(tr(me, "reject_item", why=why))
+        context.application.create_task(update.message.reply_text(tr(me, "reject_item", why=why)), update=update)
         return AWAIT_NEW_ITEM_TITLE
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     listing = supabase.table("listings").select(
@@ -2651,7 +2731,7 @@ async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_T
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(tr(me, "ok_item_updated"))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_item_updated")), update=update)
     return await edit_menu_back(update, context)
 
 async def receive_new_brand_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2661,11 +2741,11 @@ async def receive_new_brand_model(update: Update, context: ContextTypes.DEFAULT_
     if new_brand_model:
         ok, why = await moderate_text(new_brand_model)
         if not ok:
-            await update.message.reply_text(tr(me, "reject_brand_model", why=why))
+            context.application.create_task(update.message.reply_text(tr(me, "reject_brand_model", why=why)), update=update)
             return AWAIT_NEW_BRAND_MODEL
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     listing = supabase.table("listings").select(
@@ -2681,7 +2761,7 @@ async def receive_new_brand_model(update: Update, context: ContextTypes.DEFAULT_
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(tr(me, "ok_brand_updated"))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_brand_updated")), update=update)
     return await edit_menu_back(update, context)
 
 async def receive_new_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2689,12 +2769,12 @@ async def receive_new_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.strip()
     ok, why = await moderate_text(raw)
     if not ok:
-        await update.message.reply_text(tr(me, "reject_specs", why=why))
+        context.application.create_task(update.message.reply_text(tr(me, "reject_specs", why=why)), update=update)
         return AWAIT_NEW_SPECS
     new_specs = [s.strip() for s in raw.split(",") if s.strip()]
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     listing = supabase.table("listings").select(
@@ -2710,7 +2790,7 @@ async def receive_new_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(tr(me, "ok_specs_updated"))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_specs_updated")), update=update)
     return await edit_menu_back(update, context)
 
 async def receive_new_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2722,7 +2802,7 @@ async def receive_new_category(update: Update, context: ContextTypes.DEFAULT_TYP
 
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     # Get current row (only the columns used by the embedding builder)
@@ -2740,9 +2820,12 @@ async def receive_new_category(update: Update, context: ContextTypes.DEFAULT_TYP
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(
-        tr(me, "ok_category_updated", cat=new_category),
-        reply_markup=main_menu_keyboard(str(update.effective_user.id))
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "ok_category_updated", cat=new_category),
+            reply_markup=main_menu_keyboard(str(update.effective_user.id))
+        ),
+        update=update
     )
     return await edit_menu_back(update, context)
 
@@ -2751,11 +2834,11 @@ async def receive_new_description(update: Update, context: ContextTypes.DEFAULT_
     new_desc = update.message.text
     ok, why = await moderate_text(new_desc)
     if not ok:
-        await update.message.reply_text(tr(me, "reject_desc", why=why))
+        context.application.create_task(update.message.reply_text(tr(me, "reject_desc", why=why)), update=update)
         return AWAIT_NEW_DESCRIPTION
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     listing = supabase.table("listings").select(
@@ -2771,9 +2854,12 @@ async def receive_new_description(update: Update, context: ContextTypes.DEFAULT_
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(
-        tr(me, "ok_desc_updated"),
-        reply_markup=main_menu_keyboard(str(update.effective_user.id))
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "ok_desc_updated"),
+            reply_markup=main_menu_keyboard(str(update.effective_user.id))
+        ),
+        update=update
     )
     # 👇 show the edit menu again
     return await edit_menu_back(update, context)
@@ -2783,16 +2869,16 @@ async def receive_new_condition(update: Update, context: ContextTypes.DEFAULT_TY
     new_condition = update.message.text
     ok, why = await moderate_text(new_condition)
     if not ok:
-        await update.message.reply_text(tr(me, "reject_condition", why=why))
+        context.application.create_task(update.message.reply_text(tr(me, "reject_condition", why=why)), update=update)
         return AWAIT_NEW_CONDITION
     listing_id = context.user_data.get("edit_listing_id")
 
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     supabase.table("listings").update({"condition": new_condition}).eq("id", listing_id).execute()
-    await update.message.reply_text(tr(me, "ok_condition_updated"), reply_markup=main_menu_keyboard(str(update.effective_user.id)))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_condition_updated"), reply_markup=main_menu_keyboard(str(update.effective_user.id))), update=update)
     return await edit_menu_back(update, context)
 
 async def receive_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2801,7 +2887,7 @@ async def receive_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = (update.message.text or "").strip()
     m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
     if not m:
-        await update.message.reply_text(tr(me, "price_format_hint"), parse_mode="Markdown")
+        context.application.create_task(update.message.reply_text(tr(me, "price_format_hint"), parse_mode="Markdown"), update=update)
         return AWAIT_NEW_PRICE
 
     amount = float(m.group(1).replace(",", "."))
@@ -2812,7 +2898,7 @@ async def receive_new_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "currency": currency
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(tr(me, "ok_price_updated"), reply_markup=main_menu_keyboard(str(update.effective_user.id)))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_price_updated"), reply_markup=main_menu_keyboard(str(update.effective_user.id))), update=update)
     return await edit_menu_back(update, context)
 
 async def receive_new_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2820,7 +2906,7 @@ async def receive_new_location(update: Update, context: ContextTypes.DEFAULT_TYP
     new_location = update.message.text
     listing_id = context.user_data.get("edit_listing_id")
     if not listing_id:
-        await update.message.reply_text(tr(me, "something_wrong"))
+        context.application.create_task(update.message.reply_text(tr(me, "something_wrong")), update=update)
         return ConversationHandler.END
 
     listing = supabase.table("listings").select(
@@ -2836,9 +2922,12 @@ async def receive_new_location(update: Update, context: ContextTypes.DEFAULT_TYP
         "embedding": embedding
     }).eq("id", listing_id).execute()
 
-    await update.message.reply_text(
-        tr(me, "ok_location_updated"),
-        reply_markup=main_menu_keyboard(str(update.effective_user.id))
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "ok_location_updated"),
+            reply_markup=main_menu_keyboard(str(update.effective_user.id))
+        ),
+        update=update
     )
     return await edit_menu_back(update, context)
 
@@ -2847,7 +2936,7 @@ async def update_listing_description(update: Update, context: ContextTypes.DEFAU
     listing_id = context.user_data.get("edit_listing_id")
     new_text = update.message.text
     supabase.table("listings").update({"description": new_text}).eq("id", listing_id).execute()
-    await update.message.reply_text(tr(me, "ok_desc_updated_simple"), reply_markup=main_menu_keyboard(str(update.effective_user.id)))
+    context.application.create_task(update.message.reply_text(tr(me, "ok_desc_updated_simple"), reply_markup=main_menu_keyboard(str(update.effective_user.id))), update=update)
 
     return await edit_menu_back(update, context)
 
@@ -2870,14 +2959,14 @@ async def confirm_delete_listing(update: Update, context: ContextTypes.DEFAULT_T
     # 🧹 Delete old media messages
     for msg_id in context.user_data.get("last_media_messages", []):
         try:
-            await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
+            context.application.create_task(context.bot.delete_message(chat_id=chat.id, message_id=msg_id), update=update)
         except Exception as e:
             print(f"Failed to delete media message {msg_id}: {e}")
     context.user_data["last_media_messages"] = []
 
     # 🧹 Delete the listing text block
     try:
-        await query.message.delete()
+        context.application.create_task(query.message.delete(), update=update)
     except Exception as e:
         print(f"Failed to delete main listing message: {e}")
 
@@ -2887,9 +2976,12 @@ async def confirm_delete_listing(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton(tr(me, "delete_no"), callback_data="confirm_delete_no")]
     ])
 
-    await chat.send_message(
-        tr(me, "delete_confirm"),
-        reply_markup=keyboard
+    context.application.create_task(
+        chat.send_message(
+            tr(me, "delete_confirm"),
+            reply_markup=keyboard
+        ),
+        update=update
     )
 
     return CONFIRM_DELETE
@@ -2910,17 +3002,17 @@ async def handle_delete_confirmation(update: Update, context: ContextTypes.DEFAU
         listings = result.data or []
 
         if not listings:
-            await query.message.reply_text(tr(me, "delete_done_none_left"))
+            context.application.create_task(query.message.reply_text(tr(me, "delete_done_none_left")), update=update)
             return ConversationHandler.END
 
         context.user_data["my_listings"] = listings
         context.user_data["listing_index"] = 0
-        await query.message.reply_text(tr(me, "delete_done"))
+        context.application.create_task(query.message.reply_text(tr(me, "delete_done")), update=update)
         await send_single_listing(update, context)
         return ConversationHandler.END
 
     elif decision == "confirm_delete_no":
-        await query.message.reply_text(tr(me, "delete_cancelled"))
+        context.application.create_task(query.message.reply_text(tr(me, "delete_cancelled")), update=update)
         return ConversationHandler.END
 
 # --- i18n additions for Create Listing + Rental flow (patch LOCALES defined above) ---
@@ -3256,11 +3348,14 @@ async def start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quota = _quota_line_text(me)
     if (not sub_active) and max_allowed is not None and used >= max_allowed:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_purchase"), callback_data="shop_open")]])
-        await update.message.reply_text(tr(me, "limit_hit", quota=quota), reply_markup=kb)
+        context.application.create_task(update.message.reply_text(tr(me, "limit_hit", quota=quota), reply_markup=kb), update=update)
         return ConversationHandler.END
-    await update.message.reply_text(
-        tr(me, "create_pick_category"),
-        reply_markup=category_keyboard(me)
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "create_pick_category"),
+            reply_markup=category_keyboard(me)
+        ),
+        update=update
     )
 
     return GET_CATEGORY
@@ -3274,9 +3369,12 @@ async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     canon = to_canonical_category(cat_raw, me) or cat_raw  # allow free text, but prefer canonical
     context.user_data['category'] = canon
 
-    await update.message.reply_text(
-        tr(me, "create_item_prompt_with_examples"),
-        reply_markup=ReplyKeyboardRemove()
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "create_item_prompt_with_examples"),
+            reply_markup=ReplyKeyboardRemove()
+        ),
+        update=update
     )
     return GET_ITEM_TITLE
 
@@ -3286,10 +3384,10 @@ async def get_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_item", why=why))
+        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_item", why=why)), update=update)
         return GET_ITEM_TITLE
     context.user_data['item_title'] = text
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_specs_prompt"))
+    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_specs_prompt")), update=update)
     return GET_SPECS
 
 async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3299,22 +3397,25 @@ async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check as a joined string
     ok, why = await moderate_text(", ".join(specs))
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_specs", why=why))
+        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_specs", why=why)), update=update)
         return GET_SPECS
     context.user_data['specs'] = specs
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_desc_prompt"), reply_markup=ReplyKeyboardRemove())
+    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_desc_prompt"), reply_markup=ReplyKeyboardRemove()), update=update)
     return GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_desc", why=why))
+        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_desc", why=why)), update=update)
         return GET_DESCRIPTION
     context.user_data['description'] = text
-    await update.message.reply_text(
-        tr(str(update.effective_user.id), "create_condition_prompt"),
-        reply_markup=ReplyKeyboardRemove()
+    context.application.create_task(
+        update.message.reply_text(
+            tr(str(update.effective_user.id), "create_condition_prompt"),
+            reply_markup=ReplyKeyboardRemove()
+        ),
+        update=update
     )
     return GET_CONDITION
 
@@ -3322,10 +3423,10 @@ async def get_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_condition", why=why))
+        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_condition", why=why)), update=update)
         return GET_CONDITION
     context.user_data['condition'] = text
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_price_prompt"), reply_markup=ReplyKeyboardRemove())
+    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_price_prompt"), reply_markup=ReplyKeyboardRemove()), update=update)
     return GET_PRICE
 
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3333,7 +3434,7 @@ async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Accept: "100", "100 PLN", "120.50 eur", "120,50 uah"
     m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
     if not m:
-        await update.message.reply_text(tr(str(update.effective_user.id), "price_format_hint"), parse_mode="Markdown")
+        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "price_format_hint"), parse_mode="Markdown"), update=update)
         return GET_PRICE
 
     amount = float(m.group(1).replace(",", "."))
@@ -3342,7 +3443,7 @@ async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['price_per_day'] = amount
     context.user_data['currency'] = currency
 
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_send_photos"))
+    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_send_photos")), update=update)
     context.user_data['photos'] = []
     return GET_PHOTOS
 
@@ -3359,9 +3460,9 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx is not None:
             if 0 <= idx < len(context.user_data['photos']):
                 context.user_data['photos'].pop(idx)
-                await update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_stage_keyboard(me)), update=update)
             else:
-                await update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_stage_keyboard(me))
+                context.application.create_task(update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_stage_keyboard(me)), update=update)
             return GET_PHOTOS
 
         # cancel listing
@@ -3371,35 +3472,38 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # continue -> ask for location (localized buttons)
         if text.lower() == tr(me, "photos_continue").lower():
-            await update.message.reply_text(
-                tr(me, "share_location_or_type"),
-                reply_markup=ReplyKeyboardMarkup(
-                    [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
-                    tr(me, "cancel_listing_btn")]],
-                    resize_keyboard=True
-                )
+            context.application.create_task(
+                update.message.reply_text(
+                    tr(me, "share_location_or_type"),
+                    reply_markup=ReplyKeyboardMarkup(
+                        [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
+                        tr(me, "cancel_listing_btn")]],
+                        resize_keyboard=True
+                    )
+                ),
+                update=update
             )
             return GET_LOCATION
 
         # add more: just re-show the keyboard
         if text.lower() == tr(me, "photos_add_more").lower():
-            await update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me))
+            context.application.create_task(update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me)), update=update)
             return GET_PHOTOS
 
-        await update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
+        context.application.create_task(update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me)), update=update)
         return GET_PHOTOS
 
     elif update.message.photo:
         file_id = update.message.photo[-1].file_id
         ok, why = await moderate_telegram_photo(file_id, context.bot)
         if not ok:
-            await update.message.reply_text(tr(me, "photo_rejected", why=why), reply_markup=photo_stage_keyboard(me))
+            context.application.create_task(update.message.reply_text(tr(me, "photo_rejected", why=why), reply_markup=photo_stage_keyboard(me)), update=update)
             return GET_PHOTOS
         context.user_data['photos'].append(file_id)
-        await update.message.reply_text(tr(me, "photo_added", n=len(context.user_data['photos']), remaining=max(0, 3-len(context.user_data['photos']))), reply_markup=photo_stage_keyboard(me))
+        context.application.create_task(update.message.reply_text(tr(me, "photo_added", n=len(context.user_data['photos']), remaining=max(0, 3-len(context.user_data['photos']))), reply_markup=photo_stage_keyboard(me)), update=update)
         return GET_PHOTOS
 
-    await update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
+    context.application.create_task(update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me)), update=update)
     return GET_PHOTOS
 
 async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3413,12 +3517,15 @@ async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if location:
             context.user_data['location'] = f"{location.latitude},{location.longitude}"
         else:
-            await update.message.reply_text(tr(me, "could_not_recognize_location"))
+            context.application.create_task(update.message.reply_text(tr(me, "could_not_recognize_location")), update=update)
             return GET_LOCATION
 
-    await update.message.reply_text(
-        tr(me, "availability_prompt"),
-        reply_markup=ReplyKeyboardRemove()
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "availability_prompt"),
+            reply_markup=ReplyKeyboardRemove()
+        ),
+        update=update
     )
     return GET_AVAILABILITY
 
@@ -3438,8 +3545,11 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d1 = date(int(a.group("y")), int(a.group("m")), int(a.group("d")))
             d2 = date(int(b.group("y")), int(b.group("m")), int(b.group("d")))
             if d2 < d1:
-                await update.message.reply_text(
-                    tr(me, "availability_end_before_start", start=a.group(0), end=b.group(0))
+                context.application.create_task(
+                    update.message.reply_text(
+                        tr(me, "availability_end_before_start", start=a.group(0), end=b.group(0))
+                    ),
+                    update=update
                 )
                 return GET_AVAILABILITY
             cur = d1
@@ -3484,7 +3594,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not d1 or not d2:
                 continue
             if d2 < d1:
-                await update.message.reply_text(tr(me, "availability_end_before_start", start=bits[0], end=bits[1]))
+                context.application.create_task(update.message.reply_text(tr(me, "availability_end_before_start", start=bits[0], end=bits[1])), update=update)
                 return GET_AVAILABILITY
             cur = d1
             while cur <= d2:
@@ -3492,7 +3602,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur += timedelta(days=1)
 
     if not availability:
-        await update.message.reply_text(tr(me, "availability_parse_fail"))
+        context.application.create_task(update.message.reply_text(tr(me, "availability_parse_fail")), update=update)
         return GET_AVAILABILITY
 
     context.user_data['availability'] = availability
@@ -3593,9 +3703,12 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         context.user_data.pop(k, None)
 
-    await update.message.reply_text(
-        tr(me, "listing_created"),
-        reply_markup=main_menu_keyboard(me)
+    context.application.create_task(
+        update.message.reply_text(
+            tr(me, "listing_created"),
+            reply_markup=main_menu_keyboard(me)
+        ),
+        update=update
     )
 
     # Optional quick feedback question (safe to ignore if you don't want it)
@@ -3605,7 +3718,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("👍", callback_data="ins_yes"),
                 InlineKeyboardButton("👎", callback_data="ins_no")]
             ])
-            await update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb)
+            context.application.create_task(update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb), update=update)
         except Exception:
             pass
 
@@ -3614,9 +3727,9 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_insurance_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
     if (update.message.text or "").strip().lower() == "yes":
-        await update.message.reply_text(tr(me, "insurance_yes"))
+        context.application.create_task(update.message.reply_text(tr(me, "insurance_yes")), update=update)
     else:
-        await update.message.reply_text(tr(me, "insurance_no"))
+        context.application.create_task(update.message.reply_text(tr(me, "insurance_no")), update=update)
     return await go_back(update, context)
 
 async def handle_insurance_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3638,7 +3751,7 @@ async def handle_insurance_choice(update: Update, context: ContextTypes.DEFAULT_
     # ✅ Send a simple reply (no prefix appended to the original question)
     try:
         msg_key = "insurance_yes" if choice else "insurance_no"
-        await q.message.chat.send_message(tr(me, msg_key))
+        context.application.create_task(q.message.chat.send_message(tr(me, msg_key)), update=update)
     except Exception:
         pass
 
@@ -3669,7 +3782,7 @@ async def rent_choose_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not years:
         kb = [[InlineKeyboardButton(tr(me, "back_to_listing"), callback_data="rent_back_to_listing")]]
         kb.append([InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")])
-        await q.message.edit_text(tr(me, "rent_no_days"), reply_markup=InlineKeyboardMarkup(kb))
+        context.application.create_task(q.message.edit_text(tr(me, "rent_no_days"), reply_markup=InlineKeyboardMarkup(kb)), update=update)
         return
 
     rows, row = [], []
@@ -3686,7 +3799,7 @@ async def rent_choose_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")]]
 
 
-    await q.message.edit_text(tr(me, "choose_year"), reply_markup=InlineKeyboardMarkup(rows))
+    context.application.create_task(q.message.edit_text(tr(me, "choose_year"), reply_markup=InlineKeyboardMarkup(rows)), update=update)
 
 async def rent_choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3705,7 +3818,7 @@ async def rent_choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not months:
         kb = [[InlineKeyboardButton("⬅️ Back to years", callback_data="rent_year_back")],
               [InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")]]
-        await q.message.edit_text(tr(me, "no_months", y=year), reply_markup=InlineKeyboardMarkup(kb))
+        context.application.create_task(q.message.edit_text(tr(me, "no_months", y=year), reply_markup=InlineKeyboardMarkup(kb)), update=update)
         return
 
     rows, row = [], []
@@ -3722,7 +3835,7 @@ async def rent_choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")]]
 
 
-    await q.message.edit_text(tr(me, "year_title", y=year), reply_markup=InlineKeyboardMarkup(rows))
+    context.application.create_task(q.message.edit_text(tr(me, "year_title", y=year), reply_markup=InlineKeyboardMarkup(rows)), update=update)
 
 async def rent_show_days_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # From 'rent_days_<listing_id>_<year>_<month>'
@@ -3754,8 +3867,11 @@ async def rent_show_days_month(update: Update, context: ContextTypes.DEFAULT_TYP
         InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")
     ])
 
-    await q.message.edit_text(tr(me, "pick_day", month=_month_name(month), year=year),
-                              reply_markup=InlineKeyboardMarkup(buttons))
+    context.application.create_task(
+        q.message.edit_text(tr(me, "pick_day", month=_month_name(month), year=year),
+                                  reply_markup=InlineKeyboardMarkup(buttons)),
+        update=update
+    )
 
 async def rent_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3770,11 +3886,14 @@ async def rent_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Figure out a sensible year to go back to
         d = _parse_date_any(day_token)
         year = d.year if d else context.user_data.get('rent_year', 2025)
-        await q.message.edit_text(tr(me, "day_just_taken"),
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{year}")],
-                                       [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
-                                  ))
+        context.application.create_task(
+            q.message.edit_text(tr(me, "day_just_taken"),
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{year}")],
+                                           [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
+                                      )),
+            update=update
+        )
         return
 
     sel = _add_selected_day(context, listing_id, day_token)
@@ -3792,7 +3911,7 @@ async def rent_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(tr(me, "finish_selecting"), callback_data=f"rent_finish_{listing_id}")],
         [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]
     ]
-    await q.message.edit_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    context.application.create_task(q.message.edit_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)), update=update)
 
 async def rent_back_to_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -3848,7 +3967,7 @@ async def rent_year_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")]]
 
 
-    await q.message.edit_text(tr(me, "choose_year"), reply_markup=InlineKeyboardMarkup(rows))
+    context.application.create_task(q.message.edit_text(tr(me, "choose_year"), reply_markup=InlineKeyboardMarkup(rows)), update=update)
 
 async def rent_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3875,7 +3994,7 @@ async def rent_month_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(tr(me, "back_to_years"), callback_data="rent_year_back")],
         [InlineKeyboardButton(tr(me, "cancel"), callback_data="rent_cancel")]]
 
-    await q.message.edit_text(tr(me, "year_title", y=year), reply_markup=InlineKeyboardMarkup(rows))
+    context.application.create_task(q.message.edit_text(tr(me, "year_title", y=year), reply_markup=InlineKeyboardMarkup(rows)), update=update)
 
 async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -3889,11 +4008,14 @@ async def rent_finish_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     sel = _get_selected_days(context, listing_id)
     if not sel:
-        await q.message.edit_text(tr(me, "keep_selecting_ok"),
-                                  reply_markup=InlineKeyboardMarkup(
-                                      [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
-                                       [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
-                                  ))
+        context.application.create_task(
+            q.message.edit_text(tr(me, "keep_selecting_ok"),
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
+                                           [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
+                                      )),
+            update=update
+        )
         return
 
     # Sort for nicer view
@@ -3908,7 +4030,7 @@ async def rent_finish_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton(tr(me, "no_keep_selecting"), callback_data=f"rent_confirm_no_{listing_id}")],
         [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]
     ]
-    await q.message.edit_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    context.application.create_task(q.message.edit_text(txt, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb)), update=update)
 
 async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3919,13 +4041,16 @@ async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sel = _get_selected_days(context, listing_id)
     if not sel:
-        await q.message.edit_text(
-            tr(me, "keep_selecting_ok"),
-            parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
-                 [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
-            )
+        context.application.create_task(
+            q.message.edit_text(
+                tr(me, "keep_selecting_ok"),
+                parse_mode="MarkdownV2",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{context.user_data.get('rent_year','2025')}")],
+                     [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
+                )
+            ),
+            update=update
         )
         return
 
@@ -3962,10 +4087,13 @@ async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         lender_menu = main_menu_keyboard(lender_id)  # localized + count-aware
         item_title = listing.get("item") or "Item"
-        await context.bot.send_message(
-            chat_id=int(lender_id),
-            text=tr(lender_id, "notify_lender_new_req", item=item_title),
-            reply_markup=lender_menu
+        context.application.create_task(
+            context.bot.send_message(
+                chat_id=int(lender_id),
+                text=tr(lender_id, "notify_lender_new_req", item=item_title),
+                reply_markup=lender_menu
+            ),
+            update=update
         )
     except Exception as e:
         logging.warning(f"Failed to notify lender about new request: {e}")
@@ -3992,12 +4120,15 @@ async def rent_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{footer}"
     )
 
-    await q.message.edit_text(
-        txt,
-        parse_mode="MarkdownV2",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(tr(me, "back_to_listing_btn"), callback_data=f"rent_back_to_listing_{listing_id}")]]
+    context.application.create_task(
+        q.message.edit_text(
+            txt,
+            parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(tr(me, "back_to_listing_btn"), callback_data=f"rent_back_to_listing_{listing_id}")]]
+            ),
         ),
+        update=update
     )
 
 async def rent_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4008,11 +4139,14 @@ async def rent_confirm_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, _, listing_id = q.data.split("_", 3)
     # Go back to month grid with selection preserved
     year = context.user_data.get("rent_year", "2025")
-    await q.message.edit_text(tr(me, "keep_selecting_ok"),
-                              reply_markup=InlineKeyboardMarkup(
-                                  [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{year}")],
-                                   [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
-                              ))
+    context.application.create_task(
+        q.message.edit_text(tr(me, "keep_selecting_ok"),
+                                  reply_markup=InlineKeyboardMarkup(
+                                      [[InlineKeyboardButton(tr(me, "back_to_months"), callback_data=f"rent_month_{listing_id}_{year}")],
+                                       [InlineKeyboardButton(tr(me, "cancel_reservation"), callback_data="rent_cancel")]]
+                                  )),
+        update=update
+    )
 
 # === i18n-aware label regex helpers ===
 def _labels_for(key: str) -> set[str]:
@@ -4210,10 +4344,17 @@ if __name__ == '__main__':
         print(f"Starting webhook mode on {HOST}:{PORT}")
         print(f"Webhook endpoint: {WEBHOOK_PATH}")
         print(f"Health endpoint: /health")
-        
-        # Initialize the application
-        asyncio.run(app.initialize())
-        
+
+        async def on_startup(aiohttp_app_instance):
+            # Initialize and start the PTB application inside the aiohttp event loop
+            # so all async resources (HTTP client, etc.) share the same running loop.
+            await app.initialize()
+            await app.start()
+
+        async def on_cleanup(aiohttp_app_instance):
+            await app.stop()
+            await app.shutdown()
+
         async def health_handler(request):
             return Response(text='OK', status=200)
         
@@ -4234,8 +4375,11 @@ if __name__ == '__main__':
                 print(f"Webhook error: {e}")
                 return Response(text='Error', status=500)
         
-        # Create aiohttp app
+        # Create aiohttp app with lifecycle hooks so PTB is initialized in the
+        # same event loop as the aiohttp server, preventing 'Event loop is closed' errors.
         aiohttp_app = web.Application()
+        aiohttp_app.on_startup.append(on_startup)
+        aiohttp_app.on_cleanup.append(on_cleanup)
         aiohttp_app.router.add_get('/health', health_handler)
         aiohttp_app.router.add_get('/', health_handler)
         aiohttp_app.router.add_post(WEBHOOK_PATH, webhook_handler)
