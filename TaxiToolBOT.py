@@ -73,7 +73,7 @@ LOCALES = {
             "Hi! I’m RentoTo — your tool-sharing assistant. Rent tools from others or list your own.\n\n"
             "Pick a language below. You can change it anytime with /language."
         ),
-        "home_tip": "Welcome! Here's your main menu:"
+        "home_tip": "Welcome! Here's your main menu:",
         "menu_main": "Main Menu:",
         "btn_my_account": "My Account",
         "btn_create_listing": "Create a Listing",
@@ -128,7 +128,7 @@ LOCALES = {
         "lang_uk": "Українська",
         "lang_pl": "Polski",
         "greeting": "Cześć! Jestem RentoTo — asystent do współdzielenia sprzętu. Możesz wypożyczać narzędzia od innych albo dodać własną ofertę.",
-        "home_tip": "Witaj! Oto twoje menu główne:"
+        "home_tip": "Witaj! Oto twoje menu główne:",
         "menu_main": "Menu główne:",
         "btn_my_account": "Moje konto",
         "btn_create_listing": "Dodaj ogłoszenie",
@@ -181,7 +181,7 @@ LOCALES = {
         "lang_uk": "Українська",
         "lang_pl": "Polski",
         "greeting": "Привіт! Я RentoTo — асистент зі позичання речей і інструментів. Ти можеш орендувати речі або додати власне оголошення.",
-        "home_tip": "Привіт! Ось твоє головне меню:"
+        "home_tip": "Привіт! Ось твоє головне меню:",
         "menu_main": "Головне меню:",
         "btn_my_account": "Мій акаунт",
         "btn_create_listing": "Створити оголошення",
