@@ -879,7 +879,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 4) Show your normal home/menu in the user’s current language
     await update.effective_message.reply_text(
         tr(me, "home_tip"),
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(me)
     )
 
 
