@@ -73,6 +73,7 @@ LOCALES = {
             "Hi! I’m RentoTo — your tool-sharing assistant. Rent tools from others or list your own.\n\n"
             "Pick a language below. You can change it anytime with /language."
         ),
+        "home_tip": "Welcome! Here's your main menu:"
         "menu_main": "Main Menu:",
         "btn_my_account": "My Account",
         "btn_create_listing": "Create a Listing",
@@ -127,6 +128,7 @@ LOCALES = {
         "lang_uk": "Українська",
         "lang_pl": "Polski",
         "greeting": "Cześć! Jestem RentoTo — asystent do współdzielenia sprzętu. Możesz wypożyczać narzędzia od innych albo dodać własną ofertę.",
+        "home_tip": "Witaj! Oto twoje menu główne:"
         "menu_main": "Menu główne:",
         "btn_my_account": "Moje konto",
         "btn_create_listing": "Dodaj ogłoszenie",
@@ -179,6 +181,7 @@ LOCALES = {
         "lang_uk": "Українська",
         "lang_pl": "Polski",
         "greeting": "Привіт! Я RentoTo — асистент зі позичання речей і інструментів. Ти можеш орендувати речі або додати власне оголошення.",
+        "home_tip": "Привіт! Ось твоє головне меню:"
         "menu_main": "Головне меню:",
         "btn_my_account": "Мій акаунт",
         "btn_create_listing": "Створити оголошення",
@@ -350,18 +353,21 @@ async def async_reverse(latlon):
 _MD2_SPECIAL = r'[_*[\]()~`>#+\-=|{}.!]'
 
 async def safe_send(func, *args, **kwargs):
-    """Call a PTB send/edit method with one retry + simple backoff."""
+    """Call a PTB send/edit method with minimal retries."""
     try:
         return await func(*args, **kwargs)
     except RetryAfter as e:
         # Telegram is throttling — wait the suggested time
         await asyncio.sleep(getattr(e, "retry_after", 1) + 0.5)
-        return await func(*args, **kwargs)
-    except (TimedOut, NetworkError):
-        # Transient network hiccup — short backoff and retry once
-        logging.warning("[send] transient timeout/network error; retrying once…")
-        await asyncio.sleep(0.8)
-        return await func(*args, **kwargs)
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e2:
+            logging.warning(f"[send] retry failed: {e2}")
+            raise
+    except (TimedOut, NetworkError) as e:
+        # Don't retry network errors in webhook mode - just log and fail fast
+        logging.warning(f"[send] network error (not retrying): {e}")
+        raise
         
 def _parse_ts_iso(s: str | None) -> datetime | None:
     if not s:
@@ -810,10 +816,9 @@ async def moderate_telegram_photo(file_id: str, bot) -> tuple[bool, str]:
 # /language
 async def prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    await safe_send(
-        update.message.reply_text,
-        tr(me, "choose_language"),
-        reply_markup=lang_keyboard()
+    await update.message.reply_text(
+    tr(me, "choose_language"),
+    reply_markup=lang_keyboard()
     )
 
 # set_lang_<xx> callback
@@ -826,10 +831,9 @@ async def set_language_from_callback(update: Update, context: ContextTypes.DEFAU
     if lang not in ("en", "pl", "uk"):
         lang = "en"
     set_user_lang(me, lang)
-    await safe_send(
-        q.message.reply_text,
-        tr(me, "greeting"),
-        reply_markup=main_menu_keyboard(me)
+    await q.message.reply_text(
+    tr(me, "greeting"),
+    reply_markup=main_menu_keyboard(me)
     )
 
 
