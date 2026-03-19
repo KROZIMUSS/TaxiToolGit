@@ -420,20 +420,20 @@ async def edit_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = getattr(update, "callback_query", None)
         if q:
             await q.answer()
-            context.application.create_task(q.message.edit_text(tr(me, "no_listing_in_ctx")), update=update)
+            await q.message.edit_text(tr(me, "no_listing_in_ctx"))
         else:
             if update.message:
-                context.application.create_task(update.message.reply_text(tr(me, "no_listing_in_ctx")), update=update)
+                await update.message.reply_text(tr(me, "no_listing_in_ctx"))
         return ConversationHandler.END
 
     kb = build_edit_menu_keyboard(me)
     q = getattr(update, "callback_query", None)
     if q:
         await q.answer()
-        context.application.create_task(q.message.edit_text(tr(me, "edit_what"), reply_markup=kb), update=update)
+        await q.message.edit_text(tr(me, "edit_what"), reply_markup=kb)
     else:
         if update.message:
-            context.application.create_task(update.message.reply_text(tr(me, "edit_what"), reply_markup=kb), update=update)
+            await update.message.reply_text(tr(me, "edit_what"), reply_markup=kb)
     return EDIT_CHOICE
 
 CANON_CATEGORIES = [
@@ -1221,7 +1221,7 @@ async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE
     arr = context.user_data.get("pending_reqs", [])
     idx = context.user_data.get("pending_req_idx", 0)
     if not arr:
-        context.application.create_task(q.message.edit_text(tr(me, "no_outstanding_requests")), update=update)
+        await q.message.edit_text(tr(me, "no_outstanding_requests"))
         return
 
     req = arr[idx]
@@ -1265,7 +1265,7 @@ async def _show_request_card(update_or_query, context: ContextTypes.DEFAULT_TYPE
         kb.append(nav)
     kb.append([InlineKeyboardButton(f"⬅️ {tr(me, 'back')}", callback_data="account_overview")])
 
-    context.application.create_task(q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb)), update=update)
+    await q.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_request_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1984,14 +1984,14 @@ async def send_browse_listing(update_or_query, context):
         # delete old media group
         for msg_id in context.user_data.get("browse_media_ids", []):
             try:
-                context.application.create_task(context.bot.delete_message(chat_id=chat.id, message_id=msg_id), update=update)
+                await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
             except Exception as e:
                 print(f"[browse] failed to delete media {msg_id}: {e}")
         context.user_data["browse_media_ids"] = []
 
         # delete old text message
         try:
-            context.application.create_task(q.message.delete(), update=update)
+            await q.message.delete()
         except Exception as e:
             print(f"[browse] failed to delete text message: {e}")
 
@@ -2003,7 +2003,7 @@ async def send_browse_listing(update_or_query, context):
             context.user_data["browse_media_ids"] = []
 
         # send text card
-        context.application.create_task(chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
+        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
 
     # --- First render (message case): reply with media group + text ---
     else:
@@ -2011,7 +2011,7 @@ async def send_browse_listing(update_or_query, context):
         if photos:
             media_messages = await update_or_query.message.reply_media_group([InputMediaPhoto(p) for p in photos[:3]])
             context.user_data["browse_media_ids"] = [m.message_id for m in media_messages]
-        context.application.create_task(update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
+        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
 
 
 # === View My Listings ===
@@ -2100,14 +2100,14 @@ async def send_single_listing(update_or_query, context):
         # 🧹 Delete old media messages (photos)
         for msg_id in context.user_data.get("last_media_messages", []):
             try:
-                context.application.create_task(context.bot.delete_message(chat_id=chat.id, message_id=msg_id), update=update)
+                await context.bot.delete_message(chat_id=chat.id, message_id=msg_id)
             except Exception as e:
                 print(f"Failed to delete media message {msg_id}: {e}")
         context.user_data["last_media_messages"] = []
 
         # 🧹 Delete old text message (if exists)
         try:
-            context.application.create_task(query.message.delete(), update=update)
+            await query.message.delete()
         except Exception as e:
             print(f"Failed to delete main message: {e}")
 
@@ -2117,7 +2117,7 @@ async def send_single_listing(update_or_query, context):
             context.user_data["last_media_messages"] = [m.message_id for m in media_group]
 
         # 📝 Send new text block
-        context.application.create_task(chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
+        await chat.send_message(text=msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
         
     # Handle Message (initial case)
     elif update_or_query.message:
@@ -2127,7 +2127,7 @@ async def send_single_listing(update_or_query, context):
         else:
             context.user_data["last_media_messages"] = []
 
-        context.application.create_task(update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup), update=update)
+        await update_or_query.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
 
 async def show_lending_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3396,6 +3396,7 @@ except Exception as _e:
 # === Create Listing Flow ===
 async def start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    logging.info("[create] start_listing user=%s", me)
 
     # Enforce limit
     max_allowed, _, sub_active = get_entitlement(me)
@@ -3403,20 +3404,18 @@ async def start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quota = _quota_line_text(me)
     if (not sub_active) and max_allowed is not None and used >= max_allowed:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_purchase"), callback_data="shop_open")]])
-        context.application.create_task(update.message.reply_text(tr(me, "limit_hit", quota=quota), reply_markup=kb), update=update)
+        await update.message.reply_text(tr(me, "limit_hit", quota=quota), reply_markup=kb)
         return ConversationHandler.END
-    context.application.create_task(
-        update.message.reply_text(
-            tr(me, "create_pick_category"),
-            reply_markup=category_keyboard(me)
-        ),
-        update=update
-    )
     context.user_data['_in_listing_creation'] = True
+    await update.message.reply_text(
+        tr(me, "create_pick_category"),
+        reply_markup=category_keyboard(me)
+    )
     return GET_CATEGORY
 
 async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    logging.info("[create] get_category user=%s text=%r", me, update.message.text)
     if update.message.text == tr(me, "back"):
         return await go_back(update, context)
 
@@ -3441,59 +3440,69 @@ async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_ITEM_TITLE
 
 async def get_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if (update.message.text or "").strip() == tr(str(update.effective_user.id), "back"):
+    me = str(update.effective_user.id)
+    logging.info("[create] get_item_title user=%s text=%r", me, update.message.text)
+    if (update.message.text or "").strip() == tr(me, "back"):
         return await go_back(update, context)
     text = update.message.text.strip()
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_item", why=why))
+        await update.message.reply_text(tr(me, "reject_item", why=why))
         return GET_ITEM_TITLE
     context.user_data['item_title'] = text
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_specs_prompt"))
+    await update.message.reply_text(tr(me, "create_specs_prompt"))
     return GET_SPECS
 
 async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if (update.message.text or "").strip() == tr(str(update.effective_user.id), "back"):
+    me = str(update.effective_user.id)
+    logging.info("[create] get_specs user=%s text=%r", me, update.message.text)
+    if (update.message.text or "").strip() == tr(me, "back"):
       return await go_back(update, context)
     specs = [s.strip() for s in update.message.text.split(",") if s.strip()]
     # Check as a joined string
     ok, why = await moderate_text(", ".join(specs))
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_specs", why=why))
+        await update.message.reply_text(tr(me, "reject_specs", why=why))
         return GET_SPECS
     context.user_data['specs'] = specs
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_desc_prompt"), reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(tr(me, "create_desc_prompt"), reply_markup=ReplyKeyboardRemove())
     return GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = str(update.effective_user.id)
+    logging.info("[create] get_description user=%s text=%r", me, update.message.text)
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_desc", why=why))
+        await update.message.reply_text(tr(me, "reject_desc", why=why))
         return GET_DESCRIPTION
     context.user_data['description'] = text
     await update.message.reply_text(
-        tr(str(update.effective_user.id), "create_condition_prompt"),
+        tr(me, "create_condition_prompt"),
         reply_markup=ReplyKeyboardRemove()
     )
     return GET_CONDITION
 
 async def get_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = str(update.effective_user.id)
+    logging.info("[create] get_condition user=%s text=%r", me, update.message.text)
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        await update.message.reply_text(tr(str(update.effective_user.id), "reject_condition", why=why))
+        await update.message.reply_text(tr(me, "reject_condition", why=why))
         return GET_CONDITION
     context.user_data['condition'] = text
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_price_prompt"), reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(tr(me, "create_price_prompt"), reply_markup=ReplyKeyboardRemove())
     return GET_PRICE
 
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = str(update.effective_user.id)
+    logging.info("[create] get_price user=%s text=%r", me, update.message.text)
     raw = (update.message.text or "").strip()
     # Accept: "100", "100 PLN", "120.50 eur", "120,50 uah"
     m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
     if not m:
-        await update.message.reply_text(tr(str(update.effective_user.id), "price_format_hint"), parse_mode="Markdown")
+        await update.message.reply_text(tr(me, "price_format_hint"), parse_mode="Markdown")
         return GET_PRICE
 
     amount = float(m.group(1).replace(",", "."))
@@ -3502,12 +3511,13 @@ async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['price_per_day'] = amount
     context.user_data['currency'] = currency
 
-    await update.message.reply_text(tr(str(update.effective_user.id), "create_send_photos"))
+    await update.message.reply_text(tr(me, "create_send_photos"))
     context.user_data['photos'] = []
     return GET_PHOTOS
 
 async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    logging.info("[create] get_photos user=%s has_photo=%s text=%r", me, bool(update.message.photo), update.message.text)
     if 'photos' not in context.user_data:
         context.user_data['photos'] = []
 
@@ -3564,6 +3574,7 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    logging.info("[create] get_location user=%s has_location=%s text=%r", me, bool(update.message.location), update.message.text)
     if update.message.location:
         lat, lon = update.message.location.latitude, update.message.location.longitude
         context.user_data['location'] = f"{lat},{lon}"
@@ -3584,6 +3595,7 @@ async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    logging.info("[create] get_availability user=%s text=%r", me, update.message.text)
     raw_text = (update.message.text or "").strip()
 
     # Find all dates like DD/MM/YYYY, DD-MM-YYYY, or DD,MM,YYYY (day-first)
@@ -4345,21 +4357,24 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(account_my_borrowings, pattern=r"^my_borrowings$"))
     app.add_handler(CallbackQueryHandler(account_overview,      pattern=r"^account_overview$"))
     app.add_handler(CallbackQueryHandler(edit_menu_back,        pattern=r"^edit_menu_back$"))
-    app.add_handler(CallbackQueryHandler(_debug_all_callbacks, pattern=r".*"), group=99)
 
-    # Rental flow
+    # Rental flow (registered before the debug catch-all so specific patterns take priority)
     app.add_handler(CallbackQueryHandler(rent_choose_year,     pattern=r"^rent_year_[0-9a-fA-F-]{36}$"))
-    app.add_handler(CallbackQueryHandler(rent_choose_month,    pattern=r"^rent_month_[0-9a-fA-F-]{36}_(2025|2026)$"))
+    app.add_handler(CallbackQueryHandler(rent_choose_month,    pattern=r"^rent_month_[0-9a-fA-F-]{36}_(\d{4})$"))
     app.add_handler(CallbackQueryHandler(rent_pick_day,        pattern=r"^rent_pick_[0-9a-fA-F-]{36}_.+$"))
     app.add_handler(CallbackQueryHandler(rent_back_to_listing, pattern=r"^rent_back_to_listing(?:_.+)?$"))
     app.add_handler(CallbackQueryHandler(rent_year_back,       pattern=r"^rent_year_back$"))
-    app.add_handler(CallbackQueryHandler(rent_month_back,      pattern=r"^rent_month_back_[0-9a-fA-F-]{36}_(2025|2026)$"))
+    app.add_handler(CallbackQueryHandler(rent_month_back,      pattern=r"^rent_month_back_[0-9a-fA-F-]{36}_(\d{4})$"))
     app.add_handler(CallbackQueryHandler(noop,                 pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(rent_finish_prompt,   pattern=r"^rent_finish_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_confirm_yes,     pattern=r"^rent_confirm_yes_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(rent_confirm_no,      pattern=r"^rent_confirm_no_[0-9a-fA-F-]{36}$"))
-    app.add_handler(CallbackQueryHandler(rent_show_days_month, pattern=r"^rent_days_[0-9a-fA-F-]{36}_(2025|2026)_(1[0-2]|[1-9])$"))
+    app.add_handler(CallbackQueryHandler(rent_show_days_month, pattern=r"^rent_days_[0-9a-fA-F-]{36}_(\d{4})_(1[0-2]|[1-9])$"))
     app.add_handler(CallbackQueryHandler(rent_cancel,          pattern=r"^rent_cancel$"))
+
+    # Debug catch-all: logs any callback not matched by the specific handlers above.
+    # Placed last (group=99) so it never intercepts callbacks meant for other handlers.
+    app.add_handler(CallbackQueryHandler(_debug_all_callbacks, pattern=r".*"), group=99)
 
     # Insurance feedback (Yes/No in all supported languages)
     app.add_handler(MessageHandler(filters.Regex(YESNO_RE), handle_insurance_feedback))
