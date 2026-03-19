@@ -123,6 +123,7 @@ LOCALES = {
         "edit_price": "💰 Price",
         "edit_location": "📍 Location",
         "edit_back": "🔙 Back",
+        "finish_listing_first": "Please finish creating your listing first.",
     },
     "pl": {
         "choose_language": "Wybierz język:",
@@ -176,6 +177,7 @@ LOCALES = {
         "edit_price": "💰 Cena",
         "edit_location": "📍 Lokalizacja",
         "edit_back": "🔙 Wstecz",
+        "finish_listing_first": "Proszę najpierw dokończ tworzenie ogłoszenia.",
     },
     "uk": {
         "choose_language": "Оберіть мову:",
@@ -229,6 +231,7 @@ LOCALES = {
         "edit_price": "💰 Ціна",
         "edit_location": "📍 Локація",
         "edit_back": "🔙 Назад",
+        "finish_listing_first": "Будь ласка, спочатку завершіть створення оголошення.",
     },
 }
 
@@ -826,6 +829,12 @@ async def moderate_telegram_photo(file_id: str, bot) -> tuple[bool, str]:
 # /language
 async def prompt_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    if context.user_data.get('_in_listing_creation'):
+        context.application.create_task(
+            update.message.reply_text(tr(me, "finish_listing_first")),
+            update=update
+        )
+        return
     context.application.create_task(
         update.message.reply_text(
         tr(me, "choose_language"),
@@ -912,6 +921,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === Back to Menu ===
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    context.user_data.pop('_in_listing_creation', None)
     context.application.create_task(update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me)), update=update)
     return ConversationHandler.END
 
@@ -1658,6 +1668,9 @@ async def generate_embedding(text: str):
 
 async def handle_browse(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
+    if context.user_data.get('_in_listing_creation'):
+        context.application.create_task(update.message.reply_text(tr(me, "finish_listing_first")), update=update)
+        return None
     context.application.create_task(update.message.reply_text(tr(me, "browse_prompt")), update=update)
     return AWAIT_SEARCH_QUERY
 
@@ -3359,7 +3372,7 @@ async def start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ),
         update=update
     )
-
+    context.user_data['_in_listing_creation'] = True
     return GET_CATEGORY
 
 async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3701,7 +3714,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # tidy up the create-flow state but leave unrelated user_data (e.g., language) intact
     for k in (
         "category","item_title","brand_model","specs","tags","description","condition",
-        "price_per_day","currency","photos","location","availability"
+        "price_per_day","currency","photos","location","availability","_in_listing_creation"
     ):
         context.user_data.pop(k, None)
 
