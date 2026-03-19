@@ -3413,6 +3413,7 @@ async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cat_raw = update.message.text
     canon = to_canonical_category(cat_raw, me) or cat_raw  # allow free text, but prefer canonical
+    context.user_data['_in_listing_creation'] = True
     context.user_data['category'] = canon
 
     context.application.create_task(
