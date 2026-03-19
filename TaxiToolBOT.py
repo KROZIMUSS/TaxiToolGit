@@ -920,9 +920,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Back to Menu ===
 _LISTING_CREATION_KEYS = (
-    '_in_listing_creation', 'category', 'item', 'brand_model', 'specs',
-    'description', 'condition', 'price_per_day', 'currency', 'photos',
-    'location', 'availability', 'edit_photos',
+    '_in_listing_creation',
+    'category',
+    'item_title',
+    'brand_model',
+    'specs',
+    'description',
+    'condition',
+    'price_per_day',
+    'currency',
+    'photos',
+    'location',
+    'availability',
+    'edit_photos',
+    'create_idem_key'
 )
 
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -935,18 +946,16 @@ async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === Stop Listing Creation ===
 async def stop_listing_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
-    if not context.user_data.get('_in_listing_creation'):
-        context.application.create_task(
-            update.message.reply_text(tr(me, "stop_no_listing"), reply_markup=main_menu_keyboard(me)),
-            update=update
-        )
-        return ConversationHandler.END
-    for key in _LISTING_CREATION_KEYS:
-        context.user_data.pop(key, None)
-    context.application.create_task(
-        update.message.reply_text(tr(me, "stop_cancelled_creation"), reply_markup=main_menu_keyboard(me)),
-        update=update
+
+    for key in list(context.user_data.keys()):
+        if key in _LISTING_CREATION_KEYS:
+            context.user_data.pop(key, None)
+
+    await update.message.reply_text(
+        tr(me, "stop_cancelled_creation"),
+        reply_markup=main_menu_keyboard(me)
     )
+
     return ConversationHandler.END
 
 
