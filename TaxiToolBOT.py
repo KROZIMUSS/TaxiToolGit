@@ -3411,17 +3411,23 @@ async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == tr(me, "back"):
         return await go_back(update, context)
 
-    cat_raw = update.message.text
+    cat_raw = (update.message.text or "").strip()
+
+    # safety: ignore empty category
+    if not cat_raw:
+        await update.message.reply_text(
+            tr(me, "create_pick_category"),
+            reply_markup=category_keyboard(me)
+        )
+        return GET_CATEGORY
+
     canon = to_canonical_category(cat_raw, me) or cat_raw  # allow free text, but prefer canonical
     context.user_data['_in_listing_creation'] = True
     context.user_data['category'] = canon
 
-    context.application.create_task(
-        update.message.reply_text(
-            tr(me, "create_item_prompt_with_examples"),
-            reply_markup=ReplyKeyboardRemove()
-        ),
-        update=update
+    await update.message.reply_text(
+        tr(me, "create_item_prompt_with_examples"),
+        reply_markup=ReplyKeyboardRemove()
     )
     return GET_ITEM_TITLE
 
@@ -3431,10 +3437,10 @@ async def get_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     ok, why = await moderate_text(text)
     if not ok:
-        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_item", why=why)), update=update)
+        await update.message.reply_text(tr(str(update.effective_user.id), "reject_item", why=why))
         return GET_ITEM_TITLE
     context.user_data['item_title'] = text
-    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_specs_prompt")), update=update)
+    await update.message.reply_text(tr(str(update.effective_user.id), "create_specs_prompt"))
     return GET_SPECS
 
 async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3444,25 +3450,22 @@ async def get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check as a joined string
     ok, why = await moderate_text(", ".join(specs))
     if not ok:
-        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_specs", why=why)), update=update)
+        await update.message.reply_text(tr(str(update.effective_user.id), "reject_specs", why=why))
         return GET_SPECS
     context.user_data['specs'] = specs
-    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_desc_prompt"), reply_markup=ReplyKeyboardRemove()), update=update)
+    await update.message.reply_text(tr(str(update.effective_user.id), "create_desc_prompt"), reply_markup=ReplyKeyboardRemove())
     return GET_DESCRIPTION
 
 async def get_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_desc", why=why)), update=update)
+        await update.message.reply_text(tr(str(update.effective_user.id), "reject_desc", why=why))
         return GET_DESCRIPTION
     context.user_data['description'] = text
-    context.application.create_task(
-        update.message.reply_text(
-            tr(str(update.effective_user.id), "create_condition_prompt"),
-            reply_markup=ReplyKeyboardRemove()
-        ),
-        update=update
+    await update.message.reply_text(
+        tr(str(update.effective_user.id), "create_condition_prompt"),
+        reply_markup=ReplyKeyboardRemove()
     )
     return GET_CONDITION
 
@@ -3470,10 +3473,10 @@ async def get_condition(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     ok, why = await moderate_text(text)
     if not ok:
-        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "reject_condition", why=why)), update=update)
+        await update.message.reply_text(tr(str(update.effective_user.id), "reject_condition", why=why))
         return GET_CONDITION
     context.user_data['condition'] = text
-    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_price_prompt"), reply_markup=ReplyKeyboardRemove()), update=update)
+    await update.message.reply_text(tr(str(update.effective_user.id), "create_price_prompt"), reply_markup=ReplyKeyboardRemove())
     return GET_PRICE
 
 async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3481,7 +3484,7 @@ async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Accept: "100", "100 PLN", "120.50 eur", "120,50 uah"
     m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
     if not m:
-        context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "price_format_hint"), parse_mode="Markdown"), update=update)
+        await update.message.reply_text(tr(str(update.effective_user.id), "price_format_hint"), parse_mode="Markdown")
         return GET_PRICE
 
     amount = float(m.group(1).replace(",", "."))
@@ -3490,7 +3493,7 @@ async def get_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['price_per_day'] = amount
     context.user_data['currency'] = currency
 
-    context.application.create_task(update.message.reply_text(tr(str(update.effective_user.id), "create_send_photos")), update=update)
+    await update.message.reply_text(tr(str(update.effective_user.id), "create_send_photos"))
     context.user_data['photos'] = []
     return GET_PHOTOS
 
@@ -3507,9 +3510,9 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx is not None:
             if 0 <= idx < len(context.user_data['photos']):
                 context.user_data['photos'].pop(idx)
-                context.application.create_task(update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_stage_keyboard(me)), update=update)
+                await update.message.reply_text(tr(me, "photo_deleted"), reply_markup=photo_stage_keyboard(me))
             else:
-                context.application.create_task(update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_stage_keyboard(me)), update=update)
+                await update.message.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_stage_keyboard(me))
             return GET_PHOTOS
 
         # cancel listing
@@ -3519,38 +3522,35 @@ async def get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # continue -> ask for location (localized buttons)
         if text.lower() == tr(me, "photos_continue").lower():
-            context.application.create_task(
-                update.message.reply_text(
-                    tr(me, "share_location_or_type"),
-                    reply_markup=ReplyKeyboardMarkup(
-                        [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
-                        tr(me, "cancel_listing_btn")]],
-                        resize_keyboard=True
-                    )
-                ),
-                update=update
+            await update.message.reply_text(
+                tr(me, "share_location_or_type"),
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
+                    tr(me, "cancel_listing_btn")]],
+                    resize_keyboard=True
+                )
             )
             return GET_LOCATION
 
         # add more: just re-show the keyboard
         if text.lower() == tr(me, "photos_add_more").lower():
-            context.application.create_task(update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me)), update=update)
+            await update.message.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me))
             return GET_PHOTOS
 
-        context.application.create_task(update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me)), update=update)
+        await update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
         return GET_PHOTOS
 
     elif update.message.photo:
         file_id = update.message.photo[-1].file_id
         ok, why = await moderate_telegram_photo(file_id, context.bot)
         if not ok:
-            context.application.create_task(update.message.reply_text(tr(me, "photo_rejected", why=why), reply_markup=photo_stage_keyboard(me)), update=update)
+            await update.message.reply_text(tr(me, "photo_rejected", why=why), reply_markup=photo_stage_keyboard(me))
             return GET_PHOTOS
         context.user_data['photos'].append(file_id)
-        context.application.create_task(update.message.reply_text(tr(me, "photo_added", n=len(context.user_data['photos']), remaining=max(0, 3-len(context.user_data['photos']))), reply_markup=photo_stage_keyboard(me)), update=update)
+        await update.message.reply_text(tr(me, "photo_added", n=len(context.user_data['photos']), remaining=max(0, 3-len(context.user_data['photos']))), reply_markup=photo_stage_keyboard(me))
         return GET_PHOTOS
 
-    context.application.create_task(update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me)), update=update)
+    await update.message.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
     return GET_PHOTOS
 
 async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3564,15 +3564,12 @@ async def get_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if location:
             context.user_data['location'] = f"{location.latitude},{location.longitude}"
         else:
-            context.application.create_task(update.message.reply_text(tr(me, "could_not_recognize_location")), update=update)
+            await update.message.reply_text(tr(me, "could_not_recognize_location"))
             return GET_LOCATION
 
-    context.application.create_task(
-        update.message.reply_text(
-            tr(me, "availability_prompt"),
-            reply_markup=ReplyKeyboardRemove()
-        ),
-        update=update
+    await update.message.reply_text(
+        tr(me, "availability_prompt"),
+        reply_markup=ReplyKeyboardRemove()
     )
     return GET_AVAILABILITY
 
@@ -3592,11 +3589,8 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d1 = date(int(a.group("y")), int(a.group("m")), int(a.group("d")))
             d2 = date(int(b.group("y")), int(b.group("m")), int(b.group("d")))
             if d2 < d1:
-                context.application.create_task(
-                    update.message.reply_text(
-                        tr(me, "availability_end_before_start", start=a.group(0), end=b.group(0))
-                    ),
-                    update=update
+                await update.message.reply_text(
+                    tr(me, "availability_end_before_start", start=a.group(0), end=b.group(0))
                 )
                 return GET_AVAILABILITY
             cur = d1
@@ -3641,7 +3635,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not d1 or not d2:
                 continue
             if d2 < d1:
-                context.application.create_task(update.message.reply_text(tr(me, "availability_end_before_start", start=bits[0], end=bits[1])), update=update)
+                await update.message.reply_text(tr(me, "availability_end_before_start", start=bits[0], end=bits[1]))
                 return GET_AVAILABILITY
             cur = d1
             while cur <= d2:
@@ -3649,7 +3643,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur += timedelta(days=1)
 
     if not availability:
-        context.application.create_task(update.message.reply_text(tr(me, "availability_parse_fail")), update=update)
+        await update.message.reply_text(tr(me, "availability_parse_fail"))
         return GET_AVAILABILITY
 
     context.user_data['availability'] = availability
@@ -3750,12 +3744,9 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ):
         context.user_data.pop(k, None)
 
-    context.application.create_task(
-        update.message.reply_text(
-            tr(me, "listing_created"),
-            reply_markup=main_menu_keyboard(me)
-        ),
-        update=update
+    await update.message.reply_text(
+        tr(me, "listing_created"),
+        reply_markup=main_menu_keyboard(me)
     )
 
     # Optional quick feedback question (safe to ignore if you don't want it)
@@ -3765,7 +3756,7 @@ async def get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("👍", callback_data="ins_yes"),
                 InlineKeyboardButton("👎", callback_data="ins_no")]
             ])
-            context.application.create_task(update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb), update=update)
+            await update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb)
         except Exception:
             pass
 
