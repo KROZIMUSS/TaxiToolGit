@@ -919,11 +919,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # === Back to Menu ===
+_LISTING_CREATION_KEYS = (
+    '_in_listing_creation', 'category', 'item', 'brand_model', 'specs',
+    'description', 'condition', 'price_per_day', 'currency', 'photos',
+    'location', 'availability', 'edit_photos',
+)
+
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
     context.user_data.pop('_in_listing_creation', None)
     context.application.create_task(update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me)), update=update)
     return ConversationHandler.END
+
+
+# === Stop Listing Creation ===
+async def stop_listing_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = str(update.effective_user.id)
+    if not context.user_data.get('_in_listing_creation'):
+        context.application.create_task(
+            update.message.reply_text(tr(me, "stop_no_listing"), reply_markup=main_menu_keyboard(me)),
+            update=update
+        )
+        return ConversationHandler.END
+    for key in _LISTING_CREATION_KEYS:
+        context.user_data.pop(key, None)
+    context.application.create_task(
+        update.message.reply_text(tr(me, "stop_cancelled_creation"), reply_markup=main_menu_keyboard(me)),
+        update=update
+    )
+    return ConversationHandler.END
+
 
 # === My Account ===
 async def handle_my_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3060,6 +3085,8 @@ _I18N_CREATE_RENT_PATCH = {
             "• 05,09,2025 - 12,09,2025\n"
             "You can chain multiple ranges in one message."
         ),
+        "stop_no_listing": "You're not creating a listing right now.",
+        "stop_cancelled_creation": "❌ Listing creation cancelled. All progress lost.",
         "listing_created": "✅ Listing created.",
         "insurance_q": "Would you feel safer with insurance for unexpected damage or theft?",
         "insurance_yes": "Thanks! We're working hard to implement this feature soon.",
@@ -3120,6 +3147,8 @@ _I18N_CREATE_RENT_PATCH = {
             "• 05,09,2025 - 12,09,2025\n"
             "Możesz podać wiele zakresów w jednej wiadomości."
         ),
+        "stop_no_listing": "Nie tworzysz teraz żadnego ogłoszenia.",
+        "stop_cancelled_creation": "❌ Tworzenie ogłoszenia anulowane. Postęp utracony.",
         "listing_created": "✅ Ogłoszenie utworzone.",
         "insurance_q": "Czy czuł(a)byś się bezpieczniej z ubezpieczeniem od szkód lub kradzieży?",
         "insurance_yes": "Dzięki! Pracujemy nad tą funkcją.",
@@ -3180,6 +3209,8 @@ _I18N_CREATE_RENT_PATCH = {
             "• 05,09,2025 - 12,09,2025\n"
             "Можна вказати кілька діапазонів в одному повідомленні."
         ),
+        "stop_no_listing": "Ви зараз не створюєте оголошення.",
+        "stop_cancelled_creation": "❌ Створення оголошення скасовано. Весь прогрес втрачено.",
         "listing_created": "✅ Оголошення створено.",
         "insurance_q": "Чи почувалися б ви безпечніше з страхуванням від пошкоджень або крадіжки?",
         "insurance_yes": "Дякуємо! Невдовзі додамо цю функцію.",
@@ -4215,7 +4246,10 @@ listing_conv = ConversationHandler(
         GET_LOCATION:     [MessageHandler(filters.LOCATION | filters.TEXT, get_location)],
         GET_AVAILABILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_availability)]
     },
-    fallbacks=[MessageHandler(filters.Regex(BACK_RE), go_back)]
+    fallbacks=[
+        CommandHandler("stop", stop_listing_creation),
+        MessageHandler(filters.Regex(BACK_RE), go_back),
+    ]
 )
 
 edit_conv = ConversationHandler(
@@ -4266,6 +4300,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(set_language_from_callback, pattern=r"^set_lang_(en|pl|uk)$"))  
     app.add_handler(CommandHandler("language", prompt_language))
+    app.add_handler(CommandHandler("stop", stop_listing_creation))
 
 
     # My Account (supports badge in () or [])
