@@ -412,6 +412,15 @@ async def _debug_all_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     logging.warning(f"[DBG] Unhandled callback: {q.data!r}")
     await q.answer()  # avoid spinner
 
+async def dbg_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = getattr(update.effective_user, "id", None)
+    mid = getattr(update.effective_message, "message_id", None)
+    txt = getattr(update.effective_message, "text", None)
+    logging.warning("[DBG_UPDATE] uid=%s mid=%s text=%r has_photo=%s has_loc=%s",
+                    uid, mid, txt,
+                    bool(getattr(update.effective_message, "photo", None)),
+                    bool(getattr(update.effective_message, "location", None)))
+
 async def edit_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     listing_id = context.user_data.get("edit_listing_id")
     me = str(update.effective_user.id)
@@ -4375,6 +4384,7 @@ if __name__ == '__main__':
     # Debug catch-all: logs any callback not matched by the specific handlers above.
     # Placed last (group=99) so it never intercepts callbacks meant for other handlers.
     app.add_handler(CallbackQueryHandler(_debug_all_callbacks, pattern=r".*"), group=99)
+    app.add_handler(MessageHandler(filters.ALL, dbg_update), group=-1)
 
     # Insurance feedback (Yes/No in all supported languages)
     app.add_handler(MessageHandler(filters.Regex(YESNO_RE), handle_insurance_feedback))
