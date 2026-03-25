@@ -320,6 +320,57 @@ async def supa_exec_with_retry(op, tries: int = 3, base_delay: float = 0.7):
             logging.exception("Supabase error (no more retries)")
             raise
 
+# === Stateless Flow Engine (Supabase user_flows table) ===
+
+def _get_flow_sync(user_id: str) -> dict | None:
+    """Fetch current flow row for user synchronously (called via asyncio.to_thread)."""
+    try:
+        res = supabase.table("user_flows").select("*").eq("user_id", user_id).limit(1).execute()
+        return res.data[0] if res.data else None
+    except Exception as e:
+        logging.warning("[flow] get_flow db error user=%s: %s", user_id, e)
+        return None
+
+async def get_flow(user_id: str) -> dict | None:
+    """Get current flow state for user from Supabase (async)."""
+    return await asyncio.to_thread(_get_flow_sync, user_id)
+
+async def set_flow(user_id: str, flow: str, step: str, data: dict, update_id: int) -> bool:
+    """Upsert flow state unconditionally. Idempotency is enforced in route_update before calling."""
+    try:
+        await supa_exec_with_retry(
+            lambda: supabase.table("user_flows").upsert({
+                "user_id": user_id,
+                "flow": flow,
+                "step": step,
+                "data": data,
+                "last_update_id": update_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
+        )
+        logging.info("[flow] set_flow user=%s flow=%s step=%s update_id=%s", user_id, flow, step, update_id)
+        return True
+    except Exception as e:
+        logging.warning("[flow] set_flow failed user=%s flow=%s step=%s: %s", user_id, flow, step, e)
+        return False
+
+async def clear_flow(user_id: str) -> None:
+    """Remove flow state row for user."""
+    try:
+        await supa_exec_with_retry(
+            lambda: supabase.table("user_flows").delete().eq("user_id", user_id).execute()
+        )
+        logging.info("[flow] clear_flow user=%s", user_id)
+    except Exception as e:
+        logging.warning("[flow] clear_flow failed user=%s: %s", user_id, e)
+
+def _is_new_update(flow_row: dict | None, update_id: int) -> bool:
+    """Return True if this update_id has not been processed yet (idempotency guard)."""
+    if flow_row is None:
+        return True
+    last = flow_row.get("last_update_id") or 0
+    return update_id > last
+
 @lru_cache(maxsize=2000)
 def _loc_label_cached(input_str: str) -> str:
     return _location_name_from_coords_uncached(input_str)
@@ -433,7 +484,11 @@ async def edit_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             if update.message:
                 await update.message.reply_text(tr(me, "no_listing_in_ctx"))
+        await clear_flow(me)
         return ConversationHandler.END
+
+    # Clear the edit flow step — user is back at the edit menu (next action is a callback)
+    await clear_flow(me)
 
     kb = build_edit_menu_keyboard(me)
     q = getattr(update, "callback_query", None)
@@ -948,6 +1003,7 @@ _LISTING_CREATION_KEYS = (
 async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
     context.user_data.pop('_in_listing_creation', None)
+    await clear_flow(me)
     context.application.create_task(update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me)), update=update)
     return ConversationHandler.END
 
@@ -959,6 +1015,8 @@ async def stop_listing_creation(update: Update, context: ContextTypes.DEFAULT_TY
     for key in list(context.user_data.keys()):
         if key in _LISTING_CREATION_KEYS:
             context.user_data.pop(key, None)
+
+    await clear_flow(me)
 
     await update.message.reply_text(
         tr(me, "stop_cancelled_creation"),
@@ -2661,6 +2719,9 @@ async def start_editing_listing(update: Update, context: ContextTypes.DEFAULT_TY
     listing_id = parts[1]
     context.user_data["edit_listing_id"] = listing_id
 
+    # Persist to user_flows so a different Cloud Run instance can find the listing_id
+    await set_flow(me, "edit_listing", "EDIT_CHOICE", {"edit_listing_id": listing_id}, update.update_id)
+
     kb = build_edit_menu_keyboard(me)  # <-- pass user id
     context.application.create_task(
         query.message.reply_text(
@@ -2692,25 +2753,33 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
     if query.data == "cancel_edit":
         return await cancel_editing(update, context)
 
+    # Prefer context.user_data; fall back to user_flows for cross-instance case
     listing_id = context.user_data.get("edit_listing_id")
+    if not listing_id:
+        flow_row = await get_flow(me)
+        if flow_row and flow_row.get("flow") == "edit_listing":
+            listing_id = (flow_row.get("data") or {}).get("edit_listing_id")
+            if listing_id:
+                context.user_data["edit_listing_id"] = listing_id
     if not listing_id:
         await query.edit_message_text(tr(me, "something_wrong"))
         return ConversationHandler.END
 
-    if query.data == "edit_field_description":
-        context.user_data["edit_field"] = "description"
-        prompt = tr(me, "prompt_edit_desc")
-        next_state = AWAIT_NEW_DESCRIPTION
-    elif query.data == "edit_field_price":
-        context.user_data["edit_field"] = "price"
-        prompt = tr(me, "prompt_edit_price")
-        next_state = AWAIT_NEW_PRICE
-    elif query.data == "edit_field_location":
-        context.user_data["edit_field"] = "location"
-        prompt = tr(me, "prompt_edit_location")
-        next_state = AWAIT_NEW_LOCATION
-    elif query.data == "edit_field_category":
+    # Mapping from callback data to (context key, prompt key, next state, flow step)
+    _FIELD_MAP = {
+        "edit_field_description": ("description", "prompt_edit_desc",       AWAIT_NEW_DESCRIPTION, "AWAIT_NEW_DESCRIPTION"),
+        "edit_field_price":       ("price",       "prompt_edit_price",      AWAIT_NEW_PRICE,       "AWAIT_NEW_PRICE"),
+        "edit_field_location":    ("location",    "prompt_edit_location",   AWAIT_NEW_LOCATION,    "AWAIT_NEW_LOCATION"),
+        "edit_field_condition":   ("condition",   "prompt_edit_condition",  AWAIT_NEW_CONDITION,   "AWAIT_NEW_CONDITION"),
+        "edit_field_item":        ("item",        "prompt_edit_item",       AWAIT_NEW_ITEM_TITLE,  "AWAIT_NEW_ITEM_TITLE"),
+        "edit_field_brand_model": ("brand_model", "prompt_edit_brand_model",AWAIT_NEW_BRAND_MODEL, "AWAIT_NEW_BRAND_MODEL"),
+        "edit_field_specs":       ("specs",       "prompt_edit_specs",      AWAIT_NEW_SPECS,       "AWAIT_NEW_SPECS"),
+    }
+
+    if query.data == "edit_field_category":
         context.user_data["edit_field"] = "category"
+        await set_flow(me, "edit_listing", "AWAIT_NEW_CATEGORY",
+                       {"edit_listing_id": listing_id, "edit_field": "category"}, update.update_id)
         context.application.create_task(
             query.message.reply_text(
                 tr(me, "prompt_select_category"),
@@ -2720,29 +2789,15 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         )
         return AWAIT_NEW_CATEGORY
 
-    elif query.data == "edit_field_condition":
-        context.user_data["edit_field"] = "condition"
-        prompt = tr(me, "prompt_edit_condition")
-        next_state = AWAIT_NEW_CONDITION
-    elif query.data == "edit_field_item":
-        context.user_data["edit_field"] = "item"
-        prompt = tr(me, "prompt_edit_item")
-        next_state = AWAIT_NEW_ITEM_TITLE
-    elif query.data == "edit_field_brand_model":
-        context.user_data["edit_field"] = "brand_model"
-        prompt = tr(me, "prompt_edit_brand_model")
-        next_state = AWAIT_NEW_BRAND_MODEL
-    elif query.data == "edit_field_specs":
-        context.user_data["edit_field"] = "specs"
-        prompt = tr(me, "prompt_edit_specs")
-        next_state = AWAIT_NEW_SPECS
-    elif query.data == "edit_field_photos":
+    if query.data == "edit_field_photos":
         context.user_data["edit_field"] = "photos"
-        # preload current photos
         row = supabase.table("listings").select("photos").eq("id", listing_id).execute().data[0]
-        context.user_data["edit_photos"] = coerce_list((row or {}).get("photos"))
-        context.user_data["photo_edit_mode"] = True  # mark edit mode
-
+        edit_photos = coerce_list((row or {}).get("photos"))
+        context.user_data["edit_photos"] = edit_photos
+        context.user_data["photo_edit_mode"] = True
+        await set_flow(me, "edit_listing", "AWAIT_NEW_PHOTOS",
+                       {"edit_listing_id": listing_id, "edit_field": "photos",
+                        "edit_photos": edit_photos, "photo_edit_mode": True}, update.update_id)
         context.application.create_task(
             query.message.reply_text(
                 tr(me, "photos_edit_help"),
@@ -2753,16 +2808,23 @@ async def handle_edit_field_choice(update: Update, context: ContextTypes.DEFAULT
         )
         return AWAIT_NEW_PHOTOS
 
-    else:
-        await query.edit_message_text(
-            tr(me, "unknown_option"),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back"), callback_data="edit_menu_back")]])
+    if query.data in _FIELD_MAP:
+        field_key, prompt_key, next_state, flow_step = _FIELD_MAP[query.data]
+        context.user_data["edit_field"] = field_key
+        await set_flow(me, "edit_listing", flow_step,
+                       {"edit_listing_id": listing_id, "edit_field": field_key}, update.update_id)
+        cancel_button = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_cancel"), callback_data="cancel_edit")]])
+        context.application.create_task(
+            query.message.reply_text(tr(me, prompt_key), reply_markup=cancel_button, parse_mode="Markdown"),
+            update=update
         )
-        return EDIT_CHOICE
+        return next_state
 
-    cancel_button = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_cancel"), callback_data="cancel_edit")]])
-    context.application.create_task(query.message.reply_text(prompt, reply_markup=cancel_button, parse_mode="Markdown"), update=update)
-    return next_state
+    await query.edit_message_text(
+        tr(me, "unknown_option"),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "back"), callback_data="edit_menu_back")]])
+    )
+    return EDIT_CHOICE
 
 async def receive_new_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = str(update.effective_user.id)
@@ -3001,6 +3063,8 @@ async def update_listing_description(update: Update, context: ContextTypes.DEFAU
 async def cancel_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    me = str(update.effective_user.id)
+    await clear_flow(me)
     # Go straight back to the listing card (no “Cancelled” text)
     return await _back_to_listing_from_edit(update, context)
 
@@ -3823,6 +3887,586 @@ async def handle_insurance_choice(update: Update, context: ContextTypes.DEFAULT_
     except Exception:
         pass
 
+# ===== Stateless Create Listing Flow =====
+
+async def sl_start_listing(update: Update, context: ContextTypes.DEFAULT_TYPE, update_id: int) -> None:
+    """Stateless entry point for the create listing flow."""
+    me = str(update.effective_user.id)
+    logging.info("[sl_create] sl_start_listing user=%s update_id=%s", me, update_id)
+
+    max_allowed, _, sub_active = get_entitlement(me)
+    used = get_used_listings(me)
+    quota = _quota_line_text(me)
+    if (not sub_active) and max_allowed is not None and used >= max_allowed:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(tr(me, "btn_purchase"), callback_data="shop_open")]])
+        await update.message.reply_text(tr(me, "limit_hit", quota=quota), reply_markup=kb)
+        return
+
+    idem = uuid.uuid4().hex
+    data = {"create_idem_key": idem}
+    await set_flow(me, "create_listing", "GET_CATEGORY", data, update_id)
+    await update.message.reply_text(
+        tr(me, "create_pick_category"),
+        reply_markup=category_keyboard(me)
+    )
+
+
+async def sl_get_category(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    text = (update.message.text or "").strip()
+    logging.info("[sl_create] sl_get_category user=%s text=%r", me, text)
+
+    if not text:
+        await update.message.reply_text(tr(me, "create_pick_category"), reply_markup=category_keyboard(me))
+        return
+
+    canon = to_canonical_category(text, me) or text
+    data["category"] = canon
+    await set_flow(me, "create_listing", "GET_ITEM_TITLE", data, update_id)
+    await update.message.reply_text(
+        tr(me, "create_item_prompt_with_examples"),
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+async def sl_get_item_title(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    text = (update.message.text or "").strip()
+    logging.info("[sl_create] sl_get_item_title user=%s text=%r", me, text)
+
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(tr(me, "reject_item", why=why))
+        return
+
+    data["item_title"] = text
+    await set_flow(me, "create_listing", "GET_SPECS", data, update_id)
+    await update.message.reply_text(tr(me, "create_specs_prompt"))
+
+
+async def sl_get_specs(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    text = update.message.text or ""
+    logging.info("[sl_create] sl_get_specs user=%s text=%r", me, text)
+
+    specs = [s.strip() for s in text.split(",") if s.strip()]
+    ok, why = await moderate_text(", ".join(specs))
+    if not ok:
+        await update.message.reply_text(tr(me, "reject_specs", why=why))
+        return
+
+    data["specs"] = specs
+    await set_flow(me, "create_listing", "GET_DESCRIPTION", data, update_id)
+    await update.message.reply_text(tr(me, "create_desc_prompt"), reply_markup=ReplyKeyboardRemove())
+
+
+async def sl_get_description(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    text = update.message.text or ""
+    logging.info("[sl_create] sl_get_description user=%s text=%r", me, text[:80])
+
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(tr(me, "reject_desc", why=why))
+        return
+
+    data["description"] = text
+    await set_flow(me, "create_listing", "GET_CONDITION", data, update_id)
+    await update.message.reply_text(tr(me, "create_condition_prompt"), reply_markup=ReplyKeyboardRemove())
+
+
+async def sl_get_condition(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    text = update.message.text or ""
+    logging.info("[sl_create] sl_get_condition user=%s text=%r", me, text)
+
+    ok, why = await moderate_text(text)
+    if not ok:
+        await update.message.reply_text(tr(me, "reject_condition", why=why))
+        return
+
+    data["condition"] = text
+    await set_flow(me, "create_listing", "GET_PRICE", data, update_id)
+    await update.message.reply_text(tr(me, "create_price_prompt"), reply_markup=ReplyKeyboardRemove())
+
+
+async def sl_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    raw = (update.message.text or "").strip()
+    logging.info("[sl_create] sl_get_price user=%s text=%r", me, raw)
+
+    m = re.match(r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]{3})?\s*$', raw)
+    if not m:
+        await update.message.reply_text(tr(me, "price_format_hint"), parse_mode="Markdown")
+        return
+
+    data["price_per_day"] = float(m.group(1).replace(",", "."))
+    data["currency"] = (m.group(2) or "PLN").upper()
+    data["photos"] = data.get("photos") or []
+    await set_flow(me, "create_listing", "GET_PHOTOS", data, update_id)
+    await update.message.reply_text(tr(me, "create_send_photos"))
+
+
+async def sl_get_photos(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    me = str(update.effective_user.id)
+    msg = update.effective_message
+    photos = list(data.get("photos") or [])
+    logging.info("[sl_create] sl_get_photos user=%s n_photos=%s has_photo=%s text=%r",
+                 me, len(photos), bool(msg.photo), msg.text)
+
+    if msg.text:
+        text = msg.text.strip()
+        low = text.lower()
+
+        # Cancel listing buttons
+        cancel_keys = {tr(me, "photos_cancel_listing").lower(), tr(me, "cancel_listing_btn").lower()}
+        if low in cancel_keys:
+            await clear_flow(me)
+            await msg.reply_text(tr(me, "stop_cancelled_creation"), reply_markup=main_menu_keyboard(me))
+            return
+
+        # Delete N (localized)
+        idx = parse_delete_idx(text, me)
+        if idx is not None:
+            if 0 <= idx < len(photos):
+                photos.pop(idx)
+                data["photos"] = photos
+                await set_flow(me, "create_listing", "GET_PHOTOS", data, update_id)
+                await msg.reply_text(tr(me, "photo_deleted"), reply_markup=photo_stage_keyboard(me))
+            else:
+                await msg.reply_text(tr(me, "photo_invalid_number"), reply_markup=photo_stage_keyboard(me))
+            return
+
+        # Continue -> location step
+        if low == tr(me, "photos_continue").lower():
+            await set_flow(me, "create_listing", "GET_LOCATION", data, update_id)
+            await msg.reply_text(
+                tr(me, "share_location_or_type"),
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton(tr(me, "send_location_btn"), request_location=True),
+                      tr(me, "cancel_listing_btn")]],
+                    resize_keyboard=True
+                )
+            )
+            return
+
+        # Add more
+        if low == tr(me, "photos_add_more").lower():
+            await msg.reply_text(tr(me, "photos_send_prompt"), reply_markup=photo_stage_keyboard(me))
+            return
+
+        await msg.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
+        return
+
+    elif msg.photo:
+        if len(photos) >= 3:
+            await msg.reply_text(tr(me, "photos_already_three"), reply_markup=photo_stage_keyboard(me))
+            return
+
+        file_id = msg.photo[-1].file_id
+        ok, why = await moderate_telegram_photo(file_id, context.bot)
+        if not ok:
+            await msg.reply_text(tr(me, "photo_rejected", why=why), reply_markup=photo_stage_keyboard(me))
+            return
+
+        photos.append(file_id)
+        data["photos"] = photos
+        await set_flow(me, "create_listing", "GET_PHOTOS", data, update_id)
+        await msg.reply_text(
+            tr(me, "photo_added", n=len(photos), remaining=max(0, 3 - len(photos))),
+            reply_markup=photo_stage_keyboard(me)
+        )
+        return
+
+    # Other message type
+    await msg.reply_text(tr(me, "send_photo_or_cmd"), reply_markup=photo_stage_keyboard(me))
+
+
+async def sl_get_location(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    """Stateless get_location handler — fixes cancel button and non-text guard."""
+    me = str(update.effective_user.id)
+    msg = update.effective_message
+    logging.info("[sl_create] sl_get_location user=%s has_loc=%s text=%r",
+                 me, bool(msg.location), msg.text)
+
+    # Cancel button (shown on the location step keyboard)
+    if msg.text and msg.text.strip().lower() == tr(me, "cancel_listing_btn").lower():
+        await clear_flow(me)
+        await msg.reply_text(tr(me, "stop_cancelled_creation"), reply_markup=main_menu_keyboard(me))
+        return
+
+    if msg.location:
+        lat, lon = msg.location.latitude, msg.location.longitude
+        data["location"] = f"{lat},{lon}"
+    elif msg.text and msg.text.strip():
+        city_name = msg.text.strip()
+        location = await async_geocode(city_name)
+        if location:
+            data["location"] = f"{location.latitude},{location.longitude}"
+        else:
+            await msg.reply_text(tr(me, "could_not_recognize_location"))
+            return  # Stay on GET_LOCATION, do not advance
+    else:
+        # Non-text, non-location update (sticker, voice, etc.) — prompt again
+        await msg.reply_text(tr(me, "could_not_recognize_location"))
+        return
+
+    await set_flow(me, "create_listing", "GET_AVAILABILITY", data, update_id)
+    await msg.reply_text(tr(me, "availability_prompt"), reply_markup=ReplyKeyboardRemove())
+
+
+def _parse_availability_ranges(raw_text: str) -> tuple[list[str], str | None, str | None]:
+    """
+    Parse date ranges from raw_text into a sorted list of YYYY-MM-DD strings.
+    Returns (dates, None, None) on success.
+    Returns ([], bad_start, bad_end) when an end-before-start pair is found.
+    Returns ([], None, None) when no valid ranges could be parsed.
+    Wraps date() construction in try/except to prevent crashes on invalid dates.
+    """
+    availability: list[str] = []
+
+    # Primary pattern: DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY, DD,MM,YYYY (day-first)
+    pat = re.compile(r'(?P<d>\d{1,2})\s*[\./,\-]\s*(?P<m>\d{1,2})\s*[\./,\-]\s*(?P<y>\d{4})')
+    matches = list(pat.finditer(raw_text))
+
+    if len(matches) >= 2:
+        pairs = [(matches[i], matches[i + 1]) for i in range(0, len(matches) - 1, 2)]
+        for a, b in pairs:
+            try:
+                d1 = date(int(a.group("y")), int(a.group("m")), int(a.group("d")))
+                d2 = date(int(b.group("y")), int(b.group("m")), int(b.group("d")))
+            except ValueError:
+                continue  # Skip invalid calendar dates (e.g. 31/02/2026)
+            if d2 < d1:
+                return [], a.group(0), b.group(0)
+            cur = d1
+            while cur <= d2:
+                availability.append(cur.strftime("%Y-%m-%d"))
+                cur += timedelta(days=1)
+
+    # Fallback 1: strict "DD/MM/YYYY - DD/MM/YYYY, ..." format
+    if not availability:
+        chunks = raw_text.split(",")
+        for period in chunks:
+            try:
+                start_str, end_str = period.strip().split("-")
+                start_date = datetime.strptime(start_str.strip(), "%d/%m/%Y").date()
+                end_date = datetime.strptime(end_str.strip(), "%d/%m/%Y").date()
+                if end_date < start_date:
+                    raise ValueError("end before start")
+                cur = start_date
+                while cur <= end_date:
+                    availability.append(cur.strftime("%Y-%m-%d"))
+                    cur += timedelta(days=1)
+            except Exception:
+                pass
+
+    # Fallback 2: multi-separator ranges
+    if not availability:
+        date_fmts = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d,%m,%Y"]
+
+        def _try_parse(s: str) -> date | None:
+            for fmt in date_fmts:
+                try:
+                    return datetime.strptime(s.strip(), fmt).date()
+                except Exception:
+                    pass
+            return None
+
+        period_chunks = re.split(r'\s*(?:;|,)\s*', raw_text)
+        for period in period_chunks:
+            bits = re.split(r'\s*[-–—]\s*', period.strip())
+            if len(bits) != 2:
+                continue
+            d1 = _try_parse(bits[0])
+            d2 = _try_parse(bits[1])
+            if not d1 or not d2:
+                continue
+            if d2 < d1:
+                return [], bits[0], bits[1]
+            cur = d1
+            while cur <= d2:
+                availability.append(cur.strftime("%Y-%m-%d"))
+                cur += timedelta(days=1)
+
+    return availability, None, None
+
+
+async def sl_get_availability(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    """Stateless get_availability handler — date-parse crash-safe."""
+    me = str(update.effective_user.id)
+    raw_text = (update.message.text or "").strip()
+    logging.info("[sl_create] sl_get_availability user=%s text=%r", me, raw_text[:80])
+
+    availability, bad_start, bad_end = _parse_availability_ranges(raw_text)
+
+    if bad_start is not None:
+        await update.message.reply_text(
+            tr(me, "availability_end_before_start", start=bad_start, end=bad_end)
+        )
+        return
+
+    if not availability:
+        await update.message.reply_text(tr(me, "availability_parse_fail"))
+        return
+
+    # ---- Build listing from flow data ----
+    idem = data.get("create_idem_key") or uuid.uuid4().hex
+    data["create_idem_key"] = idem
+
+    row_like = {
+        "item": data.get("item_title"),
+        "brand_model": data.get("brand_model"),
+        "specs": data.get("specs"),
+        "tags": data.get("tags"),
+        "location": data.get("location"),
+        "description": data.get("description"),
+        "category": data.get("category"),
+    }
+    embedding_input = build_embedding_input_from_row(row_like)
+    logging.info("[sl_create] availability done → building embedding for user=%s", me)
+    embedding = await generate_embedding(embedding_input)
+
+    category    = data.get("category") or ""
+    item_title  = data.get("item_title") or data.get("title") or "Untitled"
+    brand_model = data.get("brand_model") or None
+    specs       = data.get("specs") or []
+    tags        = data.get("tags") or []
+    location    = data.get("location") or ""
+    description = data.get("description") or ""
+    condition   = data.get("condition") or ""
+    price       = float(data.get("price_per_day") or 0)
+    currency    = (data.get("currency") or "PLN").upper()
+    photos      = list(data.get("photos") or [])[:3]
+
+    # Ensure user row exists (FK guard)
+    try:
+        rows = supabase.table("users").select("id").eq("id", me).limit(1).execute().data
+        if not rows:
+            supabase.table("users").insert({
+                "id": me,
+                "telegram_username": update.effective_user.username or None,
+                "display_name": (update.effective_user.full_name or update.effective_user.first_name or "").strip() or None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "location": location or None,
+            }).execute()
+    except Exception as e:
+        logging.warning("[sl_create] ensure user row failed: %s", e)
+
+    try:
+        had_listings = bool(
+            supabase.table("listings").select("id").eq("owner_id", me).limit(1).execute().data
+        )
+    except Exception:
+        had_listings = True
+
+    payload = {
+        "owner_id":       me,
+        "category":       category,
+        "item":           item_title,
+        "brand_model":    brand_model,
+        "specs":          specs,
+        "tags":           tags,
+        "description":    description,
+        "condition":      condition,
+        "price_per_day":  price,
+        "currency":       currency,
+        "photos":         photos,
+        "location":       location,
+        "availability":   availability,
+        "booked_days":    [],
+        "embedding":      embedding,
+        "idempotency_key": idem,
+    }
+
+    await supa_exec_with_retry(
+        lambda: supabase.table("listings").upsert(payload, on_conflict="idempotency_key").execute()
+    )
+    logging.info("[sl_create] listing upserted user=%s idem=%s", me, idem)
+
+    # Clear flow
+    await clear_flow(me)
+
+    await update.message.reply_text(tr(me, "listing_created"), reply_markup=main_menu_keyboard(me))
+
+    if not had_listings:
+        try:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("👍", callback_data="ins_yes"),
+                 InlineKeyboardButton("👎", callback_data="ins_no")]
+            ])
+            await update.message.reply_text(tr(me, "insurance_q"), reply_markup=kb)
+        except Exception:
+            pass
+
+
+# ===== Stateless Browse Flow =====
+
+async def sl_handle_browse(update: Update, context: ContextTypes.DEFAULT_TYPE, update_id: int) -> None:
+    """Stateless entry point for browse: asks for search query and waits."""
+    me = str(update.effective_user.id)
+    logging.info("[sl_browse] sl_handle_browse user=%s update_id=%s", me, update_id)
+    await set_flow(me, "browse", "AWAIT_SEARCH_QUERY", {}, update_id)
+    await update.message.reply_text(tr(me, "browse_prompt"))
+
+
+async def sl_handle_natural_search(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict, update_id: int) -> None:
+    """Stateless search: process query, show results, then clear browse flow."""
+    me = str(update.effective_user.id)
+    logging.info("[sl_browse] sl_handle_natural_search user=%s update_id=%s", me, update_id)
+    # Clear flow immediately (results browsing uses context.user_data callbacks which are session-local)
+    await clear_flow(me)
+    # Delegate to existing handle_natural_search (it uses context.user_data for result caching)
+    await handle_natural_search(update, context)
+
+
+# ===== Stateless Flow Dispatchers =====
+
+async def _route_create_step(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              step: str, data: dict, update_id: int) -> None:
+    """Dispatch to the stateless create listing step handler for the given step."""
+    dispatch = {
+        "GET_CATEGORY":     sl_get_category,
+        "GET_ITEM_TITLE":   sl_get_item_title,
+        "GET_SPECS":        sl_get_specs,
+        "GET_DESCRIPTION":  sl_get_description,
+        "GET_CONDITION":    sl_get_condition,
+        "GET_PRICE":        sl_get_price,
+        "GET_PHOTOS":       sl_get_photos,
+        "GET_LOCATION":     sl_get_location,
+        "GET_AVAILABILITY": sl_get_availability,
+    }
+    handler = dispatch.get(step)
+    if handler:
+        await handler(update, context, data, update_id)
+    else:
+        logging.warning("[router] unknown create_listing step=%s user=%s", step,
+                        getattr(update.effective_user, "id", "?"))
+
+
+async def _route_edit_step(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            step: str, data: dict, update_id: int) -> None:
+    """
+    Handle an incoming message for a user in edit_listing flow on a DIFFERENT instance
+    than the one that set the step.  Injects needed keys into context.user_data so the
+    existing receive_new_* handlers work without modification.
+    """
+    me = str(update.effective_user.id)
+    listing_id = data.get("edit_listing_id")
+    if not listing_id:
+        logging.warning("[router] edit_listing flow has no edit_listing_id user=%s", me)
+        await clear_flow(me)
+        return
+
+    # Inject edit state into context.user_data for compatibility with existing handlers
+    context.user_data["edit_listing_id"] = listing_id
+    if data.get("edit_photos") is not None:
+        context.user_data["edit_photos"] = list(data["edit_photos"])
+    if data.get("photo_edit_mode"):
+        context.user_data["photo_edit_mode"] = True
+
+    dispatch = {
+        "AWAIT_NEW_DESCRIPTION": receive_new_description,
+        "AWAIT_NEW_PRICE":       receive_new_price,
+        "AWAIT_NEW_LOCATION":    receive_new_location,
+        "AWAIT_NEW_CATEGORY":    receive_new_category,
+        "AWAIT_NEW_CONDITION":   receive_new_condition,
+        "AWAIT_NEW_ITEM_TITLE":  receive_new_item_title,
+        "AWAIT_NEW_BRAND_MODEL": receive_new_brand_model,
+        "AWAIT_NEW_SPECS":       receive_new_specs,
+        "AWAIT_NEW_PHOTOS":      receive_new_photos,
+    }
+    handler = dispatch.get(step)
+    if handler:
+        logging.info("[router] edit cross-instance dispatch step=%s user=%s", step, me)
+        await handler(update, context)
+    else:
+        logging.warning("[router] unknown edit step=%s user=%s", step, me)
+
+
+# ===== Stateless Router =====
+
+async def route_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Unified stateless router for all text/photo/location messages.
+    Replaces listing_conv and browse_conv ConversationHandlers.
+    Uses Supabase user_flows table so state survives across Cloud Run instances.
+    """
+    if not update.effective_user or not update.effective_message:
+        return
+
+    me = str(update.effective_user.id)
+    uid_int = update.update_id
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+
+    logging.info(
+        "[router] user=%s update_id=%s text=%r has_photo=%s has_loc=%s",
+        me, uid_int, text[:80] if text else "",
+        bool(msg.photo), bool(getattr(msg, "location", None))
+    )
+
+    # ── Main menu buttons always take priority; they also cancel any active flow ──
+    if text and re.match(CREATE_RE, text):
+        await clear_flow(me)
+        await sl_start_listing(update, context, uid_int)
+        return
+
+    if text and re.match(BROWSE_RE, text):
+        await clear_flow(me)
+        await sl_handle_browse(update, context, uid_int)
+        return
+
+    if text and re.match(MY_LISTINGS_RE, text):
+        await clear_flow(me)
+        await view_my_listings(update, context)
+        return
+
+    if text and re.match(MY_ACCOUNT_RE, text):
+        await clear_flow(me)
+        await handle_my_account(update, context)
+        return
+
+    if text and re.match(BACK_RE, text):
+        await clear_flow(me)
+        await update.message.reply_text(tr(me, "menu_main"), reply_markup=main_menu_keyboard(me))
+        return
+
+    if text and re.match(YESNO_RE, text):
+        await handle_insurance_feedback(update, context)
+        return
+
+    # ── Load flow state and apply idempotency guard ──
+    flow_row = await get_flow(me)
+
+    if not _is_new_update(flow_row, uid_int):
+        logging.info("[router] idempotent skip user=%s update_id=%s", me, uid_int)
+        return
+
+    if flow_row:
+        flow = flow_row.get("flow")
+        step = flow_row.get("step") or ""
+        data = dict(flow_row.get("data") or {})
+
+        if flow == "create_listing":
+            logging.info("[router] dispatch create_listing step=%s user=%s update_id=%s", step, me, uid_int)
+            await _route_create_step(update, context, step, data, uid_int)
+            return
+
+        if flow == "browse" and step == "AWAIT_SEARCH_QUERY":
+            logging.info("[router] dispatch browse AWAIT_SEARCH_QUERY user=%s update_id=%s", me, uid_int)
+            await sl_handle_natural_search(update, context, data, uid_int)
+            return
+
+        if flow == "edit_listing":
+            logging.info("[router] dispatch edit_listing step=%s user=%s update_id=%s", step, me, uid_int)
+            await _route_edit_step(update, context, step, data, uid_int)
+            return
+
+    # No active flow and no matching button — silently ignore
+    logging.debug("[router] no handler for user=%s text=%r", me, text[:40] if text else "")
+
+
 # ===== Rental flow (Year -> Month -> Range -> Day) =====
 async def rent_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4255,24 +4899,9 @@ YESNO_RE   = r"^(?:" + "|".join((YES_LABELS | NO_LABELS)) + r")$"
 
 
 # === Conversation Handlers ===
-listing_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex(CREATE_RE), start_listing)],
-    states={
-        GET_CATEGORY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_category)],
-        GET_ITEM_TITLE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_item_title)],
-        GET_SPECS:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_specs)],
-        GET_DESCRIPTION:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_description)],
-        GET_CONDITION:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_condition)],
-        GET_PRICE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_price)],
-        GET_PHOTOS:       [MessageHandler(filters.PHOTO | filters.TEXT, get_photos)],
-        GET_LOCATION:     [MessageHandler(filters.LOCATION | filters.TEXT, get_location)],
-        GET_AVAILABILITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_availability)]
-    },
-    fallbacks=[
-        CommandHandler("stop", stop_listing_creation),
-        MessageHandler(filters.Regex(BACK_RE), go_back),
-    ]
-)
+# listing_conv and browse_conv removed: replaced by stateless route_update handler
+# backed by Supabase user_flows table (supports multi-instance Cloud Run scaling).
+# edit_conv kept for same-instance edit flows; cross-instance edit is handled by route_update.
 
 edit_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(start_editing_listing, pattern=r"^edit_[0-9a-fA-F-]{36}$")],
@@ -4290,15 +4919,7 @@ edit_conv = ConversationHandler(
         CONFIRM_DELETE:         [CallbackQueryHandler(handle_delete_confirmation)],
     },
     fallbacks=[CallbackQueryHandler(cancel_editing, pattern="^cancel_edit$")],
-    allow_reentry=True,           
-)
-
-browse_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex(BROWSE_RE), handle_browse)],
-    states={
-        AWAIT_SEARCH_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_search)]
-    },
-    fallbacks=[MessageHandler(filters.Regex(BACK_RE), go_back)]
+    allow_reentry=True,
 )
 
 
@@ -4324,10 +4945,6 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("language", prompt_language))
     app.add_handler(CommandHandler("stop", stop_listing_creation))
 
-
-    # My Account (supports badge in () or [])
-    app.add_handler(MessageHandler(filters.Regex(MY_ACCOUNT_RE), handle_my_account))
-
     # === Shop ===
     app.add_handler(CallbackQueryHandler(shop_open,   pattern=r"^shop_open$"))
     app.add_handler(CallbackQueryHandler(shop_buy_2,  pattern=r"^shop_buy_2$"))
@@ -4351,16 +4968,16 @@ if __name__ == '__main__':
     app.add_handler(CallbackQueryHandler(handle_insurance_choice, pattern=r"^ins_(?:yes|no)$"))
 
 
-    # Conversations/handlers 
-    app.add_handler(listing_conv)
-    app.add_handler(MessageHandler(filters.Regex(BACK_RE), go_back))
-    app.add_handler(MessageHandler(filters.Regex(MY_LISTINGS_RE), view_my_listings))
+    # Stateless router: handles create listing flow, browse flow, edit cross-instance
+    # steps, and all main-menu text buttons. Replaces listing_conv and browse_conv.
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.LOCATION, route_update))
+
+    # edit_conv kept for same-instance edit steps; cross-instance steps handled by route_update
     app.add_handler(edit_conv)
     app.add_handler(CallbackQueryHandler(browse_next_listing, pattern=r"^next_listing$"))
     app.add_handler(CallbackQueryHandler(browse_prev_listing, pattern=r"^prev_listing$"))
     app.add_handler(CallbackQueryHandler(confirm_delete_listing, pattern=r"^delete_[0-9a-fA-F-]{36}$"))
     app.add_handler(CallbackQueryHandler(handle_delete_confirmation, pattern=r"^confirm_delete_"))
-    app.add_handler(browse_conv)
     app.add_handler(CallbackQueryHandler(browse_next_match, pattern=r"^browse_next$"))
     app.add_handler(CallbackQueryHandler(browse_prev_match, pattern=r"^browse_prev$"))
     app.add_handler(CallbackQueryHandler(account_my_borrowings, pattern=r"^my_borrowings$"))
@@ -4385,9 +5002,6 @@ if __name__ == '__main__':
     # Placed last (group=99) so it never intercepts callbacks meant for other handlers.
     app.add_handler(CallbackQueryHandler(_debug_all_callbacks, pattern=r".*"), group=99)
     app.add_handler(MessageHandler(filters.ALL, dbg_update), group=-1)
-
-    # Insurance feedback (Yes/No in all supported languages)
-    app.add_handler(MessageHandler(filters.Regex(YESNO_RE), handle_insurance_feedback))
 
     # === run ===
     import asyncio
