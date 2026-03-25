@@ -52,6 +52,7 @@ jobs:
             --cpu 1 \
             --min-instances 3 \
             --max-instances 10 \
+            --concurrency 20 \
             --port 8080 \
             --set-env-vars MODE=webhook \
             --quiet
@@ -81,7 +82,6 @@ jobs:
           curl -sS "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/setWebhook" \
             -d "url=${{ env.SERVICE_URL }}/webhook" \
             -d "secret_token=${{ secrets.WEBHOOK_SECRET }}" \
-            -d "drop_pending_updates=true" \
             -d 'allowed_updates=["message","callback_query"]'
 
       - name: Verify webhook status
